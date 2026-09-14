@@ -218,6 +218,7 @@ static void apply_css_resolved(ModuleStyle *ms, Style s);
 typedef struct {
   ModuleStyle st_tags[5];
   ModuleStyle st_tags_hover_scratch;
+  ModuleStyle st_module_hover_scratch;
   Style st_tag_hover_css;
   ModuleStyle st_layout, st_title, st_clock, st_clock_date, st_cpu, st_mem;
   ModuleStyle st_network, st_hide_clients, st_battery;
@@ -1589,6 +1590,22 @@ static int build_module_entries(Bar *bar, const int *order, int count,
   for (int i = 0; i < count && n < max; i++)
     n += append_module_entries(bar, order[i], ents + n, max - n, texts, names,
                                text_n, name_n);
+  // The module under the pointer takes its :hover rules over its own style.
+  // The rules come from the CSS name, which drops a "#BAT0" or ".date".
+  // The tags keep their own hover style, and the overview label, which
+  // shares the name "tags", takes none.
+  for (int i = 0; i < n && bar->hover_module[0]; i++) {
+    if (ents[i].is_tray || strcmp(ents[i].module, "tags") == 0 ||
+        strcmp(ents[i].module, bar->hover_module) != 0)
+      continue;
+    char css_name[96];
+    snprintf(css_name, sizeof(css_name), "%s", ents[i].module);
+    css_name[strcspn(css_name, "#.")] = '\0';
+    g_rt->st_module_hover_scratch = *ents[i].st;
+    apply_css_resolved(&g_rt->st_module_hover_scratch,
+                       style_resolve_state(&g_style_sheet, css_name, "hover"));
+    ents[i].st = &g_rt->st_module_hover_scratch;
+  }
   return n;
 }
 
@@ -3133,36 +3150,6 @@ static void run_crossing(const char *module, bool entering) {
   run_command(cmd);
 }
 
-// An empty name means the pointer is between two modules.
-static void hovered_module(const Bar *bar, double x, char *out, size_t max) {
-  out[0] = '\0';
-  if (!bar)
-    return;
-  for (int i = 0; i < bar->hotspot_count; i++) {
-    const Hotspot *h = &bar->hotspots[i];
-    if (x >= h->x1 && x < h->x2) {
-      snprintf(out, max, "%s", h->module);
-      return;
-    }
-  }
-}
-
-// Run the leave of the old module before the enter of the new one.
-static void update_crossing(Bar *bar, double x, bool inside) {
-  if (!bar)
-    return;
-  char now[64];
-  if (inside)
-    hovered_module(bar, x, now, sizeof(now));
-  else
-    now[0] = '\0';
-  if (strcmp(now, bar->hover_module) == 0)
-    return;
-  run_crossing(bar->hover_module, false);
-  snprintf(bar->hover_module, sizeof(bar->hover_module), "%s", now);
-  run_crossing(bar->hover_module, true);
-}
-
 static void menu_open(Bar *bar, MangobarTrayItem *item, double lx, double ly);
 static void tray_right_click(Bar *bar, double x, double y);
 
@@ -4069,6 +4056,35 @@ static void setup_cursor() {
   cursor_theme = wl_cursor_theme_load(theme_name, size, shm);
 }
 
+// Find the tag or the module under the pointer, and redraw the bar when it
+// Find the tag and the module under the pointer. A change of module runs the
+// leave action of the old module before the enter action of the new one, and
+// a change of either redraws the bar. An empty name means the pointer is
+// between two modules or off the bar.
+static void update_pointer_hover(Bar *bar, bool inside) {
+  int tag = -1;
+  const char *module = "";
+  for (int i = 0; inside && i < bar->hotspot_count; i++) {
+    const Hotspot *h = &bar->hotspots[i];
+    if (pointer_x >= h->x1 && pointer_x < h->x2) {
+      module = h->module;
+      if (strcmp(h->module, "tags") == 0)
+        tag = h->tag;
+      break;
+    }
+  }
+  if (strcmp(module, bar->hover_module) != 0) {
+    run_crossing(bar->hover_module, false);
+    snprintf(bar->hover_module, sizeof(bar->hover_module), "%s", module);
+    run_crossing(bar->hover_module, true);
+    bar->redraw = true;
+  }
+  if (tag != bar->hover_tag) {
+    bar->hover_tag = tag;
+    bar->redraw = true;
+  }
+}
+
 static void wl_pointer_enter(void *data, struct wl_pointer *wl_pointer,
                              uint32_t serial, struct wl_surface *surface,
                              wl_fixed_t surface_x, wl_fixed_t surface_y) {
@@ -4129,7 +4145,9 @@ static void wl_pointer_enter(void *data, struct wl_pointer *wl_pointer,
     pointer_bar = b;
     break;
   }
-  update_crossing(pointer_bar, pointer_x, true);
+  // A pointer can rest on the bar when it appears, with no motion after.
+  if (pointer_bar)
+    update_pointer_hover(pointer_bar, true);
   if (cursor_theme) {
     struct wl_cursor *cur = wl_cursor_theme_get_cursor(cursor_theme, "default");
     if (cur) {
@@ -4156,11 +4174,8 @@ static void wl_pointer_leave(void *data, struct wl_pointer *wl_pointer,
   memset(axis_smooth_remainder, 0, sizeof(axis_smooth_remainder));
   frame_has_axis = false;
   axis_stop_mask = 0;
-  if (pointer_bar) {
-    update_crossing(pointer_bar, pointer_x, false);
-    pointer_bar->hover_tag = -1;
-    pointer_bar->redraw = true;
-  }
+  if (pointer_bar)
+    update_pointer_hover(pointer_bar, false);
   pointer_bar = NULL;
 }
 
@@ -4169,22 +4184,8 @@ static void wl_pointer_motion(void *data, struct wl_pointer *wl_pointer,
                               wl_fixed_t surface_y) {
   pointer_x = wl_fixed_to_double(surface_x);
   pointer_y = wl_fixed_to_double(surface_y);
-  if (pointer_bar) {
-    int hover = -1;
-    for (int i = 0; i < pointer_bar->hotspot_count; i++) {
-      const Hotspot *h = &pointer_bar->hotspots[i];
-      if (pointer_x >= h->x1 && pointer_x < h->x2 &&
-          strcmp(h->module, "tags") == 0 && h->tag >= 0) {
-        hover = h->tag;
-        break;
-      }
-    }
-    if (hover != pointer_bar->hover_tag) {
-      pointer_bar->hover_tag = hover;
-      pointer_bar->redraw = true;
-    }
-    update_crossing(pointer_bar, pointer_x, true);
-  }
+  if (pointer_bar)
+    update_pointer_hover(pointer_bar, true);
   if (popup_pointer && pointer_on_sub) {
     int row = popup.item_h > 0 ? (int)(pointer_y / popup.item_h) : -1;
     int vis = menu_node_visible_count(popup.sub_node);

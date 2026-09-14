@@ -916,6 +916,20 @@ Style style_resolve_module_only(const StyleSheet *ss, const char *module,
   return s;
 }
 
+Style style_resolve_state(const StyleSheet *ss, const char *module,
+                          const char *state) {
+  Style s = {0};
+  for (int pass = 0; pass < 2; pass++) {
+    const char *name = pass == 0 ? "*" : module;
+    for (int i = 0; i < ss->rule_count; i++) {
+      const StyleRule *r = &ss->rules[i];
+      if (strcmp(r->module, name) == 0 && strcmp(r->state, state) == 0)
+        apply_rule(&s, r);
+    }
+  }
+  return s;
+}
+
 const char *style_font_string(const StyleSheet *ss, const char *fallback) {
   if (!ss->font_set || !ss->font_family[0])
     return fallback;

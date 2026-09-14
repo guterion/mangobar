@@ -103,6 +103,12 @@ Style style_resolve(const StyleSheet *ss, const char *module, const char *state)
 Style style_resolve_module_only(const StyleSheet *ss, const char *module,
                                 const char *state);
 
+// Resolve the rules of one state alone: "*" with the state, then the module
+// with the state. The result carries only what those rules set, so it can
+// lie over a style that is already resolved.
+Style style_resolve_state(const StyleSheet *ss, const char *module,
+                          const char *state);
+
 // Overlay `over` on top of `base`: fields set in `over` replace base values.
 Style style_overlay(const Style *base, const Style *over);
 

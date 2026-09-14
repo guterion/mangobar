@@ -344,6 +344,130 @@ static void parse_int_pair(const char *s, int *a, int *b) {
     *b = *a;
 }
 
+// Copy the next item of a list into out and advance *p past it. The items
+// are separated by sep, or by white space when sep is ' ', and a
+// parenthesised group counts as part of one item. Returns false at the end.
+static bool next_token(const char **p, char sep, char *out, size_t outsz) {
+  const char *s = *p;
+  while (*s && (isspace((unsigned char)*s) || *s == sep))
+    s++;
+  if (!*s) {
+    *p = s;
+    return false;
+  }
+  const char *start = s;
+  int depth = 0;
+  while (*s && (depth > 0 || (sep == ' ' ? !isspace((unsigned char)*s)
+                                         : *s != sep))) {
+    if (*s == '(')
+      depth++;
+    else if (*s == ')' && depth > 0)
+      depth--;
+    s++;
+  }
+  size_t n = (size_t)(s - start);
+  while (n > 0 && isspace((unsigned char)start[n - 1]))
+    n--;
+  if (n >= outsz)
+    n = outsz - 1;
+  memcpy(out, start, n);
+  out[n] = '\0';
+  *p = s;
+  return true;
+}
+
+// Read a length in pixels: "0", "3px" or "-3px". Returns false for another
+// unit, such as a percentage.
+static bool parse_px(const char *tok, int *out) {
+  const char *d = tok[0] == '-' ? tok + 1 : tok;
+  if (!isdigit((unsigned char)*d))
+    return false;
+  const char *u = d;
+  while (isdigit((unsigned char)*u))
+    u++;
+  if (*u && strcmp(u, "px") != 0)
+    return false;
+  *out = tok[0] == '-' ? -parse_int(d) : parse_int(d);
+  return true;
+}
+
+// Parse "repeating-linear-gradient(to <side>, <stop>, ...)". A stop is a
+// color with zero, one or two lengths in pixels. The first stop starts at
+// 0, a stop without a length takes the position before it, and a position
+// never goes back. The last stop must name the period.
+static bool parse_repeating_gradient(StyleSheet *ss, const char *val,
+                                     BackgroundLayer *out) {
+  static const char name[] = "repeating-linear-gradient(";
+  if (strncmp(val, name, sizeof(name) - 1) != 0)
+    return false;
+  const char *open = val + sizeof(name) - 1;
+  const char *close = strrchr(open, ')');
+  if (!close)
+    return false;
+  char args[512];
+  size_t n = (size_t)(close - open);
+  if (n >= sizeof(args))
+    return false;
+  memcpy(args, open, n);
+  args[n] = '\0';
+
+  memset(out, 0, sizeof(*out));
+  const char *p = args;
+  char item[128];
+  bool first = true;
+  bool period = false;
+  int last = 0;
+  while (next_token(&p, ',', item, sizeof(item))) {
+    if (first && strncmp(item, "to ", 3) == 0) {
+      const char *side = item + 3;
+      while (isspace((unsigned char)*side))
+        side++;
+      if (strcmp(side, "bottom") == 0)
+        out->dir = 0;
+      else if (strcmp(side, "top") == 0)
+        out->dir = 1;
+      else if (strcmp(side, "left") == 0)
+        out->dir = 2;
+      else if (strcmp(side, "right") == 0)
+        out->dir = 3;
+      else
+        return false;
+      first = false;
+      continue;
+    }
+    first = false;
+    uint32_t color = 0;
+    bool have_color = false;
+    int pos[2];
+    int npos = 0;
+    const char *q = item;
+    char tok[64];
+    while (next_token(&q, ' ', tok, sizeof(tok))) {
+      int v;
+      if (npos < 2 && parse_px(tok, &v))
+        pos[npos++] = v;
+      else if (!have_color && parse_color_token(ss, tok, &color, 0))
+        have_color = true;
+      else
+        return false;
+    }
+    if (!have_color)
+      return false;
+    // A stop with two lengths is two stops of the same color.
+    for (int i = 0; i < (npos == 2 ? 2 : 1); i++) {
+      if (out->stop_count >= MANGOBAR_MAX_GRADIENT_STOPS)
+        return false;
+      int at = npos > i ? pos[i] : last;
+      if (at < last)
+        at = last;
+      out->stops[out->stop_count++] = (GradientStop){color, at};
+      last = at;
+    }
+    period = npos > 0;
+  }
+  return period && out->stop_count >= 2 && last > 0;
+}
+
 // Parse one shadow layer: two to four lengths, a color and, for a box, the
 // inset keyword, in any order. text-shadow takes three lengths at the most.
 // A parenthesised group such as mix(a, b, t) counts as one token.
@@ -353,26 +477,8 @@ static bool parse_shadow(StyleSheet *ss, const char *item, bool box,
   int nlen = 0;
   bool have_color = false;
   const char *p = item;
-  while (*p) {
-    while (*p && isspace((unsigned char)*p))
-      p++;
-    if (!*p)
-      break;
-    const char *start = p;
-    int depth = 0;
-    while (*p && (depth > 0 || !isspace((unsigned char)*p))) {
-      if (*p == '(')
-        depth++;
-      else if (*p == ')' && depth > 0)
-        depth--;
-      p++;
-    }
-    char tok[128];
-    size_t n = (size_t)(p - start);
-    if (n >= sizeof(tok))
-      n = sizeof(tok) - 1;
-    memcpy(tok, start, n);
-    tok[n] = '\0';
+  char tok[128];
+  while (next_token(&p, ' ', tok, sizeof(tok))) {
 
     bool number = isdigit((unsigned char)tok[0]) ||
                   (tok[0] == '-' && isdigit((unsigned char)tok[1]));
@@ -486,6 +592,19 @@ static void apply_decl(StyleSheet *ss, Style *st, const char *prop,
   } else if (strcmp(prop, "text-shadow") == 0) {
     parse_shadow_list(ss, val, false, st->text_shadows, &st->text_shadow_count,
                       &st->text_shadow_set);
+  } else if (strcmp(prop, "background-image") == 0) {
+    // A list of layers separated by commas outside parentheses. The whole
+    // list replaces the list that a wider rule set, and "none" clears it.
+    st->bg_layer_count = 0;
+    st->bg_layers_set = true;
+    const char *p = val;
+    char item[512];
+    while (next_token(&p, ',', item, sizeof(item)) &&
+           st->bg_layer_count < MANGOBAR_MAX_BG_LAYERS) {
+      BackgroundLayer layer;
+      if (parse_repeating_gradient(ss, item, &layer))
+        st->bg_layers[st->bg_layer_count++] = layer;
+    }
   } else if (strcmp(prop, "box-shadow") == 0) {
     parse_shadow_list(ss, val, true, st->box_shadows, &st->box_shadow_count,
                       &st->box_shadow_set);
@@ -833,6 +952,10 @@ static void apply_rule(Style *dst, const StyleRule *r) {
     memcpy(dst->box_shadows, s->box_shadows, sizeof(dst->box_shadows));
     dst->box_shadow_count = s->box_shadow_count;
   }
+  if (s->bg_layers_set) {
+    memcpy(dst->bg_layers, s->bg_layers, sizeof(dst->bg_layers));
+    dst->bg_layer_count = s->bg_layer_count;
+  }
   if (s->padding_left_set)
     dst->padding_left = s->padding_left;
   if (s->padding_right_set)
@@ -853,6 +976,7 @@ static void apply_rule(Style *dst, const StyleRule *r) {
   dst->border_width_set |= s->border_width_set;
   dst->text_shadow_set |= s->text_shadow_set;
   dst->box_shadow_set |= s->box_shadow_set;
+  dst->bg_layers_set |= s->bg_layers_set;
   dst->padding_left_set |= s->padding_left_set;
   dst->padding_right_set |= s->padding_right_set;
   dst->margin_top_set |= s->margin_top_set;

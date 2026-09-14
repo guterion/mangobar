@@ -207,6 +207,8 @@ typedef struct {
   int text_shadow_count;
   Shadow box_shadows[MANGOBAR_MAX_SHADOWS]; // the first lies on top
   int box_shadow_count;
+  BackgroundLayer bg_layers[MANGOBAR_MAX_BG_LAYERS]; // the first lies on top
+  int bg_layer_count;
 } ModuleStyle;
 
 static void apply_css_resolved(ModuleStyle *ms, Style s);
@@ -904,6 +906,48 @@ static void draw_box_shadows(pixman_image_t *dst, const Shadow *sh, int nsh,
     cairo_surface_mark_dirty(cairo_get_target(bar_bg_cr));
 }
 
+// Paint the background-image layers over the box at (x, y) with size w by h
+// in logical pixels and corner radius rad. Each layer is a linear cairo
+// pattern that repeats along its direction. The last layer goes first, so
+// the first layer lies on top. The layers need cairo, so a bar without its
+// cairo context draws none.
+static void draw_background_layers(const BackgroundLayer *layers, int n,
+                                   double x, double y, double w, double h,
+                                   double rad) {
+  if (!bar_bg_cr || n <= 0 || w <= 0 || h <= 0)
+    return;
+  for (int i = n - 1; i >= 0; i--) {
+    const BackgroundLayer *l = &layers[i];
+    double period = l->stops[l->stop_count - 1].pos;
+    double x0 = x, y0 = y, x1 = x, y1 = y;
+    if (l->dir == 1) { // to top: the period starts at the bottom edge
+      y0 = y + h;
+      y1 = y0 - period;
+    } else if (l->dir == 2) { // to left: the period starts at the right edge
+      x0 = x + w;
+      x1 = x0 - period;
+    } else if (l->dir == 3) {
+      x1 = x + period;
+    } else {
+      y1 = y + period;
+    }
+    cairo_pattern_t *pat = cairo_pattern_create_linear(x0, y0, x1, y1);
+    for (int s = 0; s < l->stop_count; s++) {
+      pixman_color_t pc;
+      double r, g, b, a;
+      hex_to_pixman(l->stops[s].color, &pc);
+      pixman_color_to_doubles(&pc, &r, &g, &b, &a);
+      cairo_pattern_add_color_stop_rgba(pat, l->stops[s].pos / period, r, g,
+                                        b, a);
+    }
+    cairo_pattern_set_extend(pat, CAIRO_EXTEND_REPEAT);
+    cairo_set_source(bar_bg_cr, pat);
+    cairo_rounded_rect(bar_bg_cr, x, y, w, h, rad);
+    cairo_fill(bar_bg_cr);
+    cairo_pattern_destroy(pat);
+  }
+}
+
 static uint32_t draw_text(const char *text, uint32_t x, uint32_t y,
                           pixman_image_t *fg, pixman_image_t *fg_mask,
                           pixman_image_t *bg, pixman_color_t *fg_color,
@@ -1084,6 +1128,9 @@ static void paint_module(Bar *bar, const char *module, int tag,
       cairo_fill(bar_bg_cr);
       if (pat)
         cairo_pattern_destroy(pat);
+      draw_background_layers(st->bg_layers, st->bg_layer_count, x1,
+                             g_rt->bar_top, (double)(x2 - x1), (double)buf_h,
+                             rad);
       draw_box_shadows(bg, st->box_shadows, st->box_shadow_count, true,
                        (int)x1, g_rt->bar_top, (int)(x2 - x1), (int)buf_h,
                        dscale);
@@ -1772,6 +1819,15 @@ static uint64_t style_sig(const ModuleStyle *st) {
       h = hash_mix(h, ((uint64_t)s->color << 1) | (s->inset ? 1u : 0u));
     }
   }
+  h = hash_mix(h, (uint64_t)(uint32_t)st->bg_layer_count);
+  for (int i = 0; i < st->bg_layer_count; i++) {
+    const BackgroundLayer *l = &st->bg_layers[i];
+    h = hash_mix(h, ((uint64_t)(uint32_t)l->dir << 32) |
+                        (uint32_t)l->stop_count);
+    for (int s = 0; s < l->stop_count; s++)
+      h = hash_mix(h, ((uint64_t)l->stops[s].color << 32) |
+                          (uint32_t)l->stops[s].pos);
+  }
   return h;
 }
 
@@ -2072,8 +2128,9 @@ static pixman_image_t *surface_layer(Bar *bar, pixman_image_t *img) {
 }
 
 // Paint the decoration of #bar. The layer under the modules holds the outer
-// box shadows. The layer over them holds the inset box shadows and then the
-// frame, because #bar has no fill of its own under the modules.
+// box shadows. The layer over them holds, from the bottom, the
+// background-image layers, the inset box shadows and the frame, because
+// #bar has no fill of its own under the modules.
 static void paint_bar_deco(Bar *bar, const ModuleStyle *bst,
                            uint32_t right_edge) {
   bar->deco_under = surface_layer(bar, bar->deco_under);
@@ -2081,15 +2138,11 @@ static void paint_bar_deco(Bar *bar, const ModuleStyle *bst,
   if (!bar->deco_under || !bar->deco_over || right_edge <= g_rt->bar_left)
     return;
   uint32_t scale = bar->scale > 0 ? (uint32_t)bar->scale : 1;
-  int bw_box = (int)(right_edge - g_rt->bar_left);
+  int box_w = (int)(right_edge - g_rt->bar_left);
   draw_box_shadows(bar->deco_under, bst->box_shadows, bst->box_shadow_count,
-                   false, (int)g_rt->bar_left, g_rt->bar_top, bw_box,
+                   false, (int)g_rt->bar_left, g_rt->bar_top, box_w,
                    (int)g_rt->bar_h, scale);
-  draw_box_shadows(bar->deco_over, bst->box_shadows, bst->box_shadow_count,
-                   true, (int)g_rt->bar_left, g_rt->bar_top, bw_box,
-                   (int)g_rt->bar_h, scale);
-  if (bst->border_w <= 0)
-    return;
+
   cairo_surface_t *cs = cairo_image_surface_create_for_data(
       (unsigned char *)pixman_image_get_data(bar->deco_over),
       CAIRO_FORMAT_ARGB32, bar->width, bar->height, bar->width * 4);
@@ -2100,16 +2153,30 @@ static void paint_bar_deco(Bar *bar, const ModuleStyle *bst,
   cairo_t *cr = cairo_create(cs);
   cairo_scale(cr, bar->scale, bar->scale);
   cairo_set_antialias(cr, CAIRO_ANTIALIAS_BEST);
-  double bw = bst->border_w;
-  double r, g, b, a;
-  pixman_color_to_doubles(&bst->border, &r, &g, &b, &a);
-  cairo_set_source_rgba(cr, r, g, b, a);
-  cairo_set_line_width(cr, bw);
+
+  // The helpers draw through bar_bg_cr, which points at this layer while
+  // they run.
+  bar_bg_cr = cr;
   double rad = bst->radius > 0 ? bst->radius : 0;
-  cairo_rounded_rect(cr, g_rt->bar_left + bw / 2.0, g_rt->bar_top + bw / 2.0,
-                     (double)bw_box - bw, (double)g_rt->bar_h - bw,
-                     rad > bw / 2.0 ? rad - bw / 2.0 : 0);
-  cairo_stroke(cr);
+  draw_background_layers(bst->bg_layers, bst->bg_layer_count,
+                         g_rt->bar_left, g_rt->bar_top, box_w, g_rt->bar_h,
+                         rad);
+  draw_box_shadows(bar->deco_over, bst->box_shadows, bst->box_shadow_count,
+                   true, (int)g_rt->bar_left, g_rt->bar_top, box_w,
+                   (int)g_rt->bar_h, scale);
+  bar_bg_cr = NULL;
+
+  if (bst->border_w > 0) {
+    double bw = bst->border_w;
+    double r, g, b, a;
+    pixman_color_to_doubles(&bst->border, &r, &g, &b, &a);
+    cairo_set_source_rgba(cr, r, g, b, a);
+    cairo_set_line_width(cr, bw);
+    cairo_rounded_rect(cr, g_rt->bar_left + bw / 2.0, g_rt->bar_top + bw / 2.0,
+                       (double)box_w - bw, (double)g_rt->bar_h - bw,
+                       rad > bw / 2.0 ? rad - bw / 2.0 : 0);
+    cairo_stroke(cr);
+  }
   cairo_destroy(cr);
   cairo_surface_destroy(cs);
 }
@@ -5225,6 +5292,10 @@ static void apply_css_resolved(ModuleStyle *ms, Style s) {
   if (s.box_shadow_set) {
     memcpy(ms->box_shadows, s.box_shadows, sizeof(ms->box_shadows));
     ms->box_shadow_count = s.box_shadow_count;
+  }
+  if (s.bg_layers_set) {
+    memcpy(ms->bg_layers, s.bg_layers, sizeof(ms->bg_layers));
+    ms->bg_layer_count = s.bg_layer_count;
   }
 }
 

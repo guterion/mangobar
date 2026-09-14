@@ -9,6 +9,8 @@
 #define MANGOBAR_MAX_SELECTORS 16
 #define MANGOBAR_MAX_VARS 64
 #define MANGOBAR_MAX_SHADOWS 4
+#define MANGOBAR_MAX_BG_LAYERS 4
+#define MANGOBAR_MAX_GRADIENT_STOPS 8
 
 // One layer of text-shadow or box-shadow
 typedef struct {
@@ -18,6 +20,20 @@ typedef struct {
     uint32_t color; // same format as Style.color
     bool inset; // box-shadow only: the shadow falls inside the box
 } Shadow;
+
+// One color stop of a repeating gradient
+typedef struct {
+    uint32_t color; // same format as Style.color
+    int pos; // pixels from the start of the period
+} GradientStop;
+
+// One layer of background-image: a repeating-linear-gradient. The position
+// of the last stop is the period of the pattern.
+typedef struct {
+    int dir; // 0=to bottom 1=to top 2=to left 3=to right
+    int stop_count;
+    GradientStop stops[MANGOBAR_MAX_GRADIENT_STOPS];
+} BackgroundLayer;
 
 // Single style declaration block
 typedef struct {
@@ -32,6 +48,8 @@ typedef struct {
     int text_shadow_count;
     Shadow box_shadows[MANGOBAR_MAX_SHADOWS]; // the first lies on top
     int box_shadow_count;
+    BackgroundLayer bg_layers[MANGOBAR_MAX_BG_LAYERS]; // the first lies on top
+    int bg_layer_count;
     int padding_left;
     int padding_right;
     int margin_top;
@@ -45,6 +63,7 @@ typedef struct {
     bool border_width_set;
     bool text_shadow_set;
     bool box_shadow_set;
+    bool bg_layers_set;
     bool padding_left_set;
     bool padding_right_set;
     bool margin_top_set;

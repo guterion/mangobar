@@ -76,6 +76,7 @@ executable('mangobar',
     'mangobar.c',
     'rtconfig.c',
     'style.c',
+    'blur.c',
     'tray.c',
     'menu.c'
   ],

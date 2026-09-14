@@ -8,6 +8,14 @@
 #define MANGOBAR_MAX_STYLE_RULES 128
 #define MANGOBAR_MAX_SELECTORS 16
 #define MANGOBAR_MAX_VARS 64
+#define MANGOBAR_MAX_TEXT_SHADOWS 4
+
+// One layer of text-shadow
+typedef struct {
+    int x, y; // offset in pixels
+    int blur; // blur radius in pixels; 0 = hard edge
+    uint32_t color; // same format as Style.color
+} TextShadow;
 
 // Single style declaration block
 typedef struct {
@@ -18,6 +26,8 @@ typedef struct {
     bool bg_gradient; // background is a linear gradient (start = background)
     uint32_t border_color; // ARGB border (menu, bar and modules)
     int border_width; // border thickness in pixels; 0 = none
+    TextShadow text_shadows[MANGOBAR_MAX_TEXT_SHADOWS]; // the first lies on top
+    int text_shadow_count;
     int padding_left;
     int padding_right;
     int margin_top;
@@ -29,6 +39,7 @@ typedef struct {
     bool background_set;
     bool border_color_set;
     bool border_width_set;
+    bool text_shadow_set;
     bool padding_left_set;
     bool padding_right_set;
     bool margin_top_set;

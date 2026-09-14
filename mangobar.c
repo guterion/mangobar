@@ -39,6 +39,7 @@
 #include "menu.h"
 #include "defaults.h"
 #include "rtconfig.h"
+#include "blur.h"
 #include "style.h"
 #include "tray.h"
 #include "wlr-layer-shell-unstable-v1-protocol.h"
@@ -202,6 +203,8 @@ typedef struct {
   bool center; // center text (tag buttons)
   pixman_color_t border;
   int border_w; // border thickness; 0 = none
+  TextShadow text_shadows[MANGOBAR_MAX_TEXT_SHADOWS]; // the first lies on top
+  int text_shadow_count;
 } ModuleStyle;
 
 static void apply_css_resolved(ModuleStyle *ms, Style s);
@@ -797,11 +800,61 @@ static void ensure_module_min_width(ModuleStyle *st, const char *text) {
     st->min_width = need;
 }
 
+// Paint the shadows of one glyph into dst. The last layer goes down first,
+// so the first layer of the list lies on top, as in CSS. A color glyph
+// carries no alpha mask of its own, and it takes no shadow.
+#define TEXT_SHADOW_MAX_BLUR 64
+static void draw_glyph_shadows(const struct fcft_glyph *g, int32_t gx,
+                               int32_t gy, pixman_image_t *dst,
+                               const TextShadow *sh, int nsh, uint32_t scale) {
+  if (!dst || nsh <= 0 || pixman_image_get_format(g->pix) != PIXMAN_a8)
+    return;
+  const uint8_t *mask = (const uint8_t *)pixman_image_get_data(g->pix);
+  int stride = pixman_image_get_stride(g->pix);
+  if (!mask || g->width <= 0 || g->height <= 0)
+    return;
+  for (int i = nsh - 1; i >= 0; i--) {
+    pixman_color_t color;
+    hex_to_pixman(sh[i].color, &color);
+    pixman_image_t *fill = pixman_image_create_solid_fill(&color);
+    int32_t ox = gx + sh[i].x * (int32_t)scale;
+    int32_t oy = gy + sh[i].y * (int32_t)scale;
+    int r = sh[i].blur * (int)scale;
+    if (r > TEXT_SHADOW_MAX_BLUR)
+      r = TEXT_SHADOW_MAX_BLUR;
+    if (r <= 1) {
+      pixman_image_composite32(PIXMAN_OP_OVER, fill, g->pix, dst, 0, 0, 0, 0,
+                               ox, oy, g->width, g->height);
+    } else {
+      int dw = g->width + 2 * r, dh = g->height + 2 * r;
+      int dstride = (dw + 3) & ~3;
+      uint8_t *blurred = calloc((size_t)dw * (size_t)dh, 1);
+      uint8_t *bits = calloc((size_t)dstride * (size_t)dh, 1);
+      if (blurred && bits) {
+        blur_a8(mask, g->width, g->height, stride, r, blurred);
+        for (int row = 0; row < dh; row++)
+          memcpy(bits + row * dstride, blurred + row * dw, (size_t)dw);
+        pixman_image_t *soft = pixman_image_create_bits(
+            PIXMAN_a8, dw, dh, (uint32_t *)(void *)bits, dstride);
+        if (soft) {
+          pixman_image_composite32(PIXMAN_OP_OVER, fill, soft, dst, 0, 0, 0,
+                                   0, ox - r, oy - r, dw, dh);
+          pixman_image_unref(soft);
+        }
+      }
+      free(blurred);
+      free(bits);
+    }
+    pixman_image_unref(fill);
+  }
+}
+
 static uint32_t draw_text(const char *text, uint32_t x, uint32_t y,
                           pixman_image_t *fg, pixman_image_t *fg_mask,
                           pixman_image_t *bg, pixman_color_t *fg_color,
                           pixman_color_t *bg_color, uint32_t max_x,
-                          uint32_t buf_h) {
+                          uint32_t buf_h, pixman_image_t *shadow_dst,
+                          const TextShadow *shadows, int nshadows) {
   if (!text || !*text || x >= max_x)
     return x;
   uint32_t scale = g_draw_scale > 0 ? g_draw_scale : 1;
@@ -831,6 +884,9 @@ static uint32_t draw_text(const char *text, uint32_t x, uint32_t y,
     if (gx >= (int32_t)dmax)
       break;
     last_cp = codepoint;
+
+    draw_glyph_shadows(g, gx, (int32_t)dy - g->y, shadow_dst, shadows,
+                       nshadows, scale);
 
     if (fg && fg_color) {
       if (pixman_image_get_format(g->pix) == PIXMAN_a8r8g8b8) {
@@ -1009,7 +1065,16 @@ static void paint_module(Bar *bar, const char *module, int tag,
       if (tw < inner)
         text_x = x1 + st->pad_l + (inner - tw) / 2;
     }
-    draw_text(text, text_x, y, fg, fg_mask, NULL, &st->fg, NULL, max_x, buf_h);
+    // The shadows go into the background layer, over the module box and
+    // under the text. cairo writes the same pixels, so its pending work is
+    // flushed first and pixman's marked afterwards.
+    if (st->text_shadow_count > 0 && bar_bg_cr)
+      cairo_surface_flush(cairo_get_target(bar_bg_cr));
+    draw_text(text, text_x, y, fg, fg_mask, NULL, &st->fg, NULL, max_x, buf_h,
+              st->text_shadow_count > 0 ? bg : NULL, st->text_shadows,
+              st->text_shadow_count);
+    if (st->text_shadow_count > 0 && bar_bg_cr)
+      cairo_surface_mark_dirty(cairo_get_target(bar_bg_cr));
   }
 }
 
@@ -5043,6 +5108,10 @@ static void apply_css_resolved(ModuleStyle *ms, Style s) {
     hex_to_pixman(s.border_color, &ms->border);
   if (s.border_width_set)
     ms->border_w = s.border_width;
+  if (s.text_shadow_set) {
+    memcpy(ms->text_shadows, s.text_shadows, sizeof(ms->text_shadows));
+    ms->text_shadow_count = s.text_shadow_count;
+  }
 }
 
 static void apply_css(ModuleStyle *ms, const char *module, const char *state) {

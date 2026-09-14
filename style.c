@@ -344,6 +344,57 @@ static void parse_int_pair(const char *s, int *a, int *b) {
     *b = *a;
 }
 
+// Parse one layer of text-shadow: two or three lengths and a color, in either
+// order. A parenthesised group such as mix(a, b, t) counts as one token.
+static bool parse_text_shadow(StyleSheet *ss, const char *item,
+                              TextShadow *out) {
+  int lengths[3] = {0, 0, 0};
+  int nlen = 0;
+  bool have_color = false;
+  const char *p = item;
+  while (*p) {
+    while (*p && isspace((unsigned char)*p))
+      p++;
+    if (!*p)
+      break;
+    const char *start = p;
+    int depth = 0;
+    while (*p && (depth > 0 || !isspace((unsigned char)*p))) {
+      if (*p == '(')
+        depth++;
+      else if (*p == ')' && depth > 0)
+        depth--;
+      p++;
+    }
+    char tok[128];
+    size_t n = (size_t)(p - start);
+    if (n >= sizeof(tok))
+      n = sizeof(tok) - 1;
+    memcpy(tok, start, n);
+    tok[n] = '\0';
+
+    bool number = isdigit((unsigned char)tok[0]) ||
+                  (tok[0] == '-' && isdigit((unsigned char)tok[1]));
+    char color_buf[64];
+    uint32_t c;
+    if (number) {
+      // parse_int reads the digits alone, so the sign is taken here.
+      if (nlen < 3)
+        lengths[nlen++] = tok[0] == '-' ? -parse_int(tok + 1) : parse_int(tok);
+    } else if (resolve_color_value(ss, tok, color_buf, sizeof(color_buf)) &&
+               parse_hex_color(color_buf, &c)) {
+      out->color = c;
+      have_color = true;
+    }
+  }
+  if (!have_color || nlen < 2)
+    return false;
+  out->x = lengths[0];
+  out->y = lengths[1];
+  out->blur = nlen > 2 && lengths[2] > 0 ? lengths[2] : 0;
+  return true;
+}
+
 static void apply_decl(StyleSheet *ss, Style *st, const char *prop,
                        const char *val) {
   uint32_t c;
@@ -396,6 +447,34 @@ static void apply_decl(StyleSheet *ss, Style *st, const char *prop,
         st->border_color = c;
         st->border_color_set = true;
       }
+    }
+  } else if (strcmp(prop, "text-shadow") == 0) {
+    // A list of layers separated by commas outside parentheses. The whole
+    // list replaces the list that a wider rule set.
+    st->text_shadow_count = 0;
+    st->text_shadow_set = true;
+    const char *p = val;
+    while (*p && st->text_shadow_count < MANGOBAR_MAX_TEXT_SHADOWS) {
+      const char *start = p;
+      int depth = 0;
+      while (*p && (depth > 0 || *p != ',')) {
+        if (*p == '(')
+          depth++;
+        else if (*p == ')' && depth > 0)
+          depth--;
+        p++;
+      }
+      char item[256];
+      size_t n = (size_t)(p - start);
+      if (n >= sizeof(item))
+        n = sizeof(item) - 1;
+      memcpy(item, start, n);
+      item[n] = '\0';
+      TextShadow sh = {0};
+      if (strstr(item, "none") == NULL && parse_text_shadow(ss, item, &sh))
+        st->text_shadows[st->text_shadow_count++] = sh;
+      if (*p == ',')
+        p++;
     }
   } else if (strcmp(prop, "border-radius") == 0) {
     st->radius = parse_int(val);
@@ -733,6 +812,10 @@ static void apply_rule(Style *dst, const StyleRule *r) {
     dst->border_color = s->border_color;
   if (s->border_width_set)
     dst->border_width = s->border_width;
+  if (s->text_shadow_set) {
+    memcpy(dst->text_shadows, s->text_shadows, sizeof(dst->text_shadows));
+    dst->text_shadow_count = s->text_shadow_count;
+  }
   if (s->padding_left_set)
     dst->padding_left = s->padding_left;
   if (s->padding_right_set)
@@ -751,6 +834,7 @@ static void apply_rule(Style *dst, const StyleRule *r) {
   dst->background_set |= s->background_set;
   dst->border_color_set |= s->border_color_set;
   dst->border_width_set |= s->border_width_set;
+  dst->text_shadow_set |= s->text_shadow_set;
   dst->padding_left_set |= s->padding_left_set;
   dst->padding_right_set |= s->padding_right_set;
   dst->margin_top_set |= s->margin_top_set;

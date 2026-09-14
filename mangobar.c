@@ -3055,9 +3055,14 @@ static void ipc_send_command(const char *fmt, ...) {
   close(fd);
 }
 
-static void run_command(const char *cmd) {
-  if (!cmd || !*cmd)
-    return;
+// Start cmd through /bin/sh in a new session. With capture, the output of
+// the command goes to a pipe, and the result is the read end of that pipe,
+// set to non-blocking. Without capture, the output goes to /dev/null, and
+// the result is 0. The result is -1 when the start fails.
+static int spawn_command(const char *cmd, bool capture) {
+  int out[2] = {-1, -1};
+  if (capture && pipe2(out, O_CLOEXEC) < 0)
+    return -1;
   pid_t pid = fork();
   if (pid == 0) {
     setsid();
@@ -3073,6 +3078,8 @@ static void run_command(const char *cmd) {
       if (devnull > 2)
         close(devnull);
     }
+    if (capture)
+      dup2(out[1], 1);
     // A Wayland bar must not force X11 toolkits onto spawned GUI apps
     // (e.g. GDK_BACKEND=x11 makes wlogout/satty fall back to XWayland).
     if (getenv("WAYLAND_DISPLAY")) {
@@ -3090,6 +3097,20 @@ static void run_command(const char *cmd) {
     execl("/bin/sh", "sh", "-c", cmd, (char *)NULL);
     _exit(127);
   }
+  if (!capture)
+    return pid < 0 ? -1 : 0;
+  close(out[1]);
+  if (pid < 0) {
+    close(out[0]);
+    return -1;
+  }
+  fcntl(out[0], F_SETFL, fcntl(out[0], F_GETFL) | O_NONBLOCK);
+  return out[0];
+}
+
+static void run_command(const char *cmd) {
+  if (cmd && *cmd)
+    spawn_command(cmd, false);
 }
 
 // ---------- Module actions ----------
@@ -4954,22 +4975,49 @@ static void update_system_info() {
   wl_list_for_each(b, &bar_list, link) strcpy(b->time_str, ts);
 }
 
-// Run a custom module command and store its (trimmed) output.
-static bool run_custom_module(MangoCustomModule *cm) {
-  if (!cm->enabled || !cm->exec[0])
-    return false;
-  FILE *fp = popen(cm->exec, "r");
-  if (!fp) {
-    cm->last_run_ms = now_ms();
-    return false;
-  }
-  size_t n = fread(cm->output, 1, sizeof(cm->output) - 1, fp);
-  pclose(fp);
-  while (n > 0 && (cm->output[n - 1] == '\n' || cm->output[n - 1] == '\r' ||
-                   cm->output[n - 1] == ' ' || cm->output[n - 1] == '\t'))
-    n--;
-  cm->output[n] = '\0';
+// Start a custom module command. The event loop reads its output, so a slow
+// command leaves the bar responsive.
+static void start_custom_module(MangoCustomModule *cm) {
   cm->last_run_ms = now_ms();
+  int fd = spawn_command(cm->exec, true);
+  if (fd < 0)
+    return;
+  cm->fd = fd;
+  cm->pending_len = 0;
+  cm->running = true;
+}
+
+// Read the output that the running command has ready. At the end of the
+// output, store the trimmed text and return true when it changed. The text
+// keeps the first 255 bytes, as the module shows one short line.
+static bool read_custom_module(MangoCustomModule *cm) {
+  char buf[512];
+  for (;;) {
+    ssize_t n = read(cm->fd, buf, sizeof(buf));
+    if (n > 0) {
+      size_t room = sizeof(cm->pending) - 1 - cm->pending_len;
+      size_t take = (size_t)n < room ? (size_t)n : room;
+      memcpy(cm->pending + cm->pending_len, buf, take);
+      cm->pending_len += take;
+      continue;
+    }
+    if (n < 0 && errno == EINTR)
+      continue;
+    if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
+      return false;
+    break;
+  }
+  close(cm->fd);
+  cm->fd = -1;
+  cm->running = false;
+  size_t n = cm->pending_len;
+  while (n > 0 && (cm->pending[n - 1] == '\n' || cm->pending[n - 1] == '\r' ||
+                   cm->pending[n - 1] == ' ' || cm->pending[n - 1] == '\t'))
+    n--;
+  cm->pending[n] = '\0';
+  if (strcmp(cm->pending, cm->output) == 0)
+    return false;
+  memcpy(cm->output, cm->pending, n + 1);
   return true;
 }
 
@@ -4989,9 +5037,9 @@ static void profile_custom_force_refresh(MangoConfigProfile *profile) {
     cfg->customs[i].last_run_ms = 0;
 }
 
-// Refresh due custom modules; returns true when any output changed.
-static bool update_custom_modules(void) {
-  bool changed = false;
+// Start the custom modules that are due. A module with a run in flight
+// waits for it, and its signal stays pending until the run ends.
+static void update_custom_modules(void) {
   uint64_t now = now_ms();
   for (size_t pi = 0; pi < g_config_set.count; pi++) {
     MangoConfigProfile *profile = &g_config_set.profiles[pi];
@@ -5000,19 +5048,16 @@ static bool update_custom_modules(void) {
     MangoConfig *cfg = &profile->config;
     for (int i = 0; i < cfg->custom_count; i++) {
       MangoCustomModule *cm = &cfg->customs[i];
-      if (!cm->enabled || !cm->exec[0])
+      if (!cm->enabled || !cm->exec[0] || cm->running)
         continue;
       bool sig_dirty = custom_signal_dirty[pi][i];
       custom_signal_dirty[pi][i] = 0;
       uint64_t due = (uint64_t)(cm->interval > 0 ? cm->interval : 0) * 1000u;
       if (sig_dirty || cm->last_run_ms == 0 ||
-          (due > 0 && now - cm->last_run_ms >= due)) {
-        if (run_custom_module(cm))
-          changed = true;
-      }
+          (due > 0 && now - cm->last_run_ms >= due))
+        start_custom_module(cm);
     }
   }
-  return changed;
 }
 
 static void tray_set_dirty() {
@@ -5072,7 +5117,8 @@ static void event_loop() {
   int wl_fd = wl_display_get_fd(display);
   while (running) {
     int tray_fd = tray ? tray_get_fd(tray) : -1;
-    struct pollfd fds[6];
+    struct pollfd fds[6 + MANGOBAR_MAX_CONFIGS * MANGOBAR_MAX_CUSTOM];
+    MangoCustomModule *cmd_of[MANGOBAR_MAX_CONFIGS * MANGOBAR_MAX_CUSTOM];
     int nfds = 0, ipc_idx = -1, tray_idx = -1, pa_idx = -1, udev_idx = -1;
     int signal_idx = -1;
     fds[nfds++] =
@@ -5098,6 +5144,17 @@ static void event_loop() {
     if (g_udev_fd >= 0) {
       udev_idx = nfds;
       fds[nfds++] = (struct pollfd){.fd = g_udev_fd, .events = POLLIN};
+    }
+    // The output pipes of the running custom module commands follow.
+    int cmd_idx = nfds, ncmds = 0;
+    for (size_t pi = 0; pi < g_config_set.count; pi++) {
+      MangoConfig *cfg = &g_config_set.profiles[pi].config;
+      for (int i = 0; i < cfg->custom_count; i++) {
+        if (!cfg->customs[i].running)
+          continue;
+        cmd_of[ncmds++] = &cfg->customs[i];
+        fds[nfds++] = (struct pollfd){.fd = cfg->customs[i].fd, .events = POLLIN};
+      }
     }
     // Short timeout while refreshing or the menu is open.
     int timeout = 1000;
@@ -5185,6 +5242,14 @@ static void event_loop() {
     }
     if (udev_idx >= 0 && (fds[udev_idx].revents & POLLIN))
       udev_dispatch();
+    for (int k = 0; k < ncmds; k++) {
+      if (!(fds[cmd_idx + k].revents & (POLLIN | POLLHUP | POLLERR)))
+        continue;
+      if (read_custom_module(cmd_of[k])) {
+        Bar *b;
+        wl_list_for_each(b, &bar_list, link) b->redraw = true;
+      }
+    }
     if (sys_refresh) {
       sys_refresh = false;
       update_system_info();
@@ -5202,10 +5267,7 @@ static void event_loop() {
       Bar *b;
       wl_list_for_each(b, &bar_list, link) b->redraw = true;
     }
-    if (update_custom_modules()) {
-      Bar *b;
-      wl_list_for_each(b, &bar_list, link) b->redraw = true;
-    }
+    update_custom_modules();
     static time_t last_sec;
     static time_t last_tray_refresh;
     time_t sec = time(NULL);
@@ -5596,6 +5658,9 @@ int main(int argc, char **argv) {
     wl_display_roundtrip(display);
     ipc_subscribe();
   }
+  // The kernel reaps the children of actions and custom modules. This comes
+  // before the first custom module starts, so no child stays a zombie.
+  signal(SIGCHLD, SIG_IGN);
   update_system_info();
   update_custom_modules();
   pulse_init();
@@ -5603,7 +5668,6 @@ int main(int argc, char **argv) {
   register_custom_signals();
   signal(SIGTERM, exit);
   signal(SIGINT, exit);
-  signal(SIGCHLD, SIG_IGN); // reap action command children
 
   event_loop();
   if (popup.open)

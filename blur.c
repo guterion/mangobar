@@ -78,3 +78,74 @@ void blur_a8(const uint8_t *src, int w, int h, int stride, int r,
   free(a);
   free(b);
 }
+
+// Fill the part of a w by h mask that the rectangle (x, y, rw, rh) covers.
+static void fill_rect(uint8_t *m, int w, int h, int x, int y, int rw, int rh,
+                      uint8_t v) {
+  int x0 = x < 0 ? 0 : x, y0 = y < 0 ? 0 : y;
+  int x1 = x + rw > w ? w : x + rw, y1 = y + rh > h ? h : y + rh;
+  for (int j = y0; j < y1; j++)
+    if (x1 > x0)
+      memset(m + j * w + x0, v, (size_t)(x1 - x0));
+}
+
+// The corners of the mask are square: a box with a border-radius gets a
+// shadow with square corners.
+uint8_t *box_shadow_mask(int w, int h, int x, int y, int blur, int spread,
+                         bool inset, int *mx, int *my, int *mw, int *mh) {
+  if (w <= 0 || h <= 0 || blur < 0)
+    return NULL;
+  int r = blur;
+
+  if (!inset) {
+    int sw = w + 2 * spread, sh = h + 2 * spread;
+    if (sw <= 0 || sh <= 0)
+      return NULL;
+    *mx = x - spread - r;
+    *my = y - spread - r;
+    *mw = sw + 2 * r;
+    *mh = sh + 2 * r;
+    uint8_t *solid = malloc((size_t)sw * (size_t)sh);
+    uint8_t *m = malloc((size_t)*mw * (size_t)*mh);
+    if (!solid || !m) {
+      free(solid);
+      free(m);
+      return NULL;
+    }
+    memset(solid, 255, (size_t)sw * (size_t)sh);
+    blur_a8(solid, sw, sh, sw, r, m);
+    free(solid);
+    // CSS paints an outer shadow only outside the border box.
+    fill_rect(m, *mw, *mh, -*mx, -*my, w, h, 0);
+    return m;
+  }
+
+  // An inset shadow is the area outside the shrunk and moved box. The
+  // canvas reaches past the box far enough that its own edge stays out of
+  // the blur that falls on the box.
+  int pad = r + 1;
+  int cw = w + 2 * pad, ch = h + 2 * pad;
+  uint8_t *canvas = malloc((size_t)cw * (size_t)ch);
+  uint8_t *big = malloc((size_t)(cw + 2 * r) * (size_t)(ch + 2 * r));
+  uint8_t *m = malloc((size_t)w * (size_t)h);
+  if (!canvas || !big || !m) {
+    free(canvas);
+    free(big);
+    free(m);
+    return NULL;
+  }
+  memset(canvas, 255, (size_t)cw * (size_t)ch);
+  int hw = w - 2 * spread, hh = h - 2 * spread;
+  if (hw > 0 && hh > 0)
+    fill_rect(canvas, cw, ch, pad + x + spread, pad + y + spread, hw, hh, 0);
+  blur_a8(canvas, cw, ch, cw, r, big);
+  for (int j = 0; j < h; j++)
+    memcpy(m + j * w, big + (j + pad + r) * (cw + 2 * r) + pad + r, (size_t)w);
+  free(canvas);
+  free(big);
+  *mx = 0;
+  *my = 0;
+  *mw = w;
+  *mh = h;
+  return m;
+}

@@ -203,8 +203,10 @@ typedef struct {
   bool center; // center text (tag buttons)
   pixman_color_t border;
   int border_w; // border thickness; 0 = none
-  TextShadow text_shadows[MANGOBAR_MAX_TEXT_SHADOWS]; // the first lies on top
+  Shadow text_shadows[MANGOBAR_MAX_SHADOWS]; // the first lies on top
   int text_shadow_count;
+  Shadow box_shadows[MANGOBAR_MAX_SHADOWS]; // the first lies on top
+  int box_shadow_count;
 } ModuleStyle;
 
 static void apply_css_resolved(ModuleStyle *ms, Style s);
@@ -225,6 +227,7 @@ typedef struct {
   ModuleStyle st_overview, st_separator, st_tray, st_bar, st_bar_sel;
   int bar_top;
   uint32_t bar_h;
+  uint32_t shadow_reach; // rows below the bar that its shadows can cover
   uint32_t bar_left, bar_right;
   char brightness_dev[64];
   bool brightness_dev_init;
@@ -570,8 +573,9 @@ typedef struct Bar {
   bool mid_painted;
   int mid_x0, mid_x1;
   uint64_t mid_key;
-  // The decoration of #bar that lies over the modules, and the key of the
-  // style and geometry that painted it.
+  // The decoration of #bar in two layers, one under the modules and one
+  // over them, and the key of the style and geometry that painted them.
+  pixman_image_t *deco_under;
   pixman_image_t *deco_over;
   uint64_t deco_key;
   DirtyList dirty;
@@ -806,7 +810,7 @@ static void ensure_module_min_width(ModuleStyle *st, const char *text) {
 #define TEXT_SHADOW_MAX_BLUR 64
 static void draw_glyph_shadows(const struct fcft_glyph *g, int32_t gx,
                                int32_t gy, pixman_image_t *dst,
-                               const TextShadow *sh, int nsh, uint32_t scale) {
+                               const Shadow *sh, int nsh, uint32_t scale) {
   if (!dst || nsh <= 0 || pixman_image_get_format(g->pix) != PIXMAN_a8)
     return;
   const uint8_t *mask = (const uint8_t *)pixman_image_get_data(g->pix);
@@ -849,12 +853,62 @@ static void draw_glyph_shadows(const struct fcft_glyph *g, int32_t gx,
   }
 }
 
+// Draw the box shadows of one kind, outer or inset, for the box at (x, y)
+// with size w by h in logical pixels. The last layer of the list goes first,
+// so the first layer lies on top. cairo shares the pixels of dst, so its
+// pending work is flushed first and the pixman writes are marked afterwards.
+#define BOX_SHADOW_MAX_BLUR 128
+static void draw_box_shadows(pixman_image_t *dst, const Shadow *sh, int nsh,
+                             bool inset, int x, int y, int w, int h,
+                             uint32_t scale) {
+  if (!dst || nsh <= 0 || w <= 0 || h <= 0)
+    return;
+  if (bar_bg_cr)
+    cairo_surface_flush(cairo_get_target(bar_bg_cr));
+  int s = (int)scale;
+  for (int i = nsh - 1; i >= 0; i--) {
+    if (sh[i].inset != inset)
+      continue;
+    int blur = sh[i].blur * s;
+    if (blur > BOX_SHADOW_MAX_BLUR)
+      blur = BOX_SHADOW_MAX_BLUR;
+    int mx, my, mw, mh;
+    uint8_t *mask =
+        box_shadow_mask(w * s, h * s, sh[i].x * s, sh[i].y * s, blur,
+                        sh[i].spread * s, inset, &mx, &my, &mw, &mh);
+    if (!mask)
+      continue;
+    int stride = (mw + 3) & ~3;
+    uint8_t *bits = calloc((size_t)stride * (size_t)mh, 1);
+    if (bits) {
+      for (int row = 0; row < mh; row++)
+        memcpy(bits + row * stride, mask + row * mw, (size_t)mw);
+      pixman_image_t *img = pixman_image_create_bits(
+          PIXMAN_a8, mw, mh, (uint32_t *)(void *)bits, stride);
+      pixman_color_t color;
+      hex_to_pixman(sh[i].color, &color);
+      pixman_image_t *fill = pixman_image_create_solid_fill(&color);
+      if (img && fill)
+        pixman_image_composite32(PIXMAN_OP_OVER, fill, img, dst, 0, 0, 0, 0,
+                                 x * s + mx, y * s + my, mw, mh);
+      if (fill)
+        pixman_image_unref(fill);
+      if (img)
+        pixman_image_unref(img);
+    }
+    free(bits);
+    free(mask);
+  }
+  if (bar_bg_cr)
+    cairo_surface_mark_dirty(cairo_get_target(bar_bg_cr));
+}
+
 static uint32_t draw_text(const char *text, uint32_t x, uint32_t y,
                           pixman_image_t *fg, pixman_image_t *fg_mask,
                           pixman_image_t *bg, pixman_color_t *fg_color,
                           pixman_color_t *bg_color, uint32_t max_x,
                           uint32_t buf_h, pixman_image_t *shadow_dst,
-                          const TextShadow *shadows, int nshadows) {
+                          const Shadow *shadows, int nshadows) {
   if (!text || !*text || x >= max_x)
     return x;
   uint32_t scale = g_draw_scale > 0 ? g_draw_scale : 1;
@@ -990,6 +1044,9 @@ static void paint_module(Bar *bar, const char *module, int tag,
   uint32_t max_x = g->x2;
   if (x2 > x1) {
     int rad = module_radius(st, buf_h);
+    uint32_t dscale = g_draw_scale > 0 ? g_draw_scale : 1;
+    draw_box_shadows(bg, st->box_shadows, st->box_shadow_count, false, (int)x1,
+                     g_rt->bar_top, (int)(x2 - x1), (int)buf_h, dscale);
     // Rounded background
     if (bar_bg_cr) {
       cairo_pattern_t *pat = NULL;
@@ -1026,6 +1083,9 @@ static void paint_module(Bar *bar, const char *module, int tag,
       cairo_fill(bar_bg_cr);
       if (pat)
         cairo_pattern_destroy(pat);
+      draw_box_shadows(bg, st->box_shadows, st->box_shadow_count, true,
+                       (int)x1, g_rt->bar_top, (int)(x2 - x1), (int)buf_h,
+                       dscale);
       // The border lies inside the module box, so it follows the radius
       // and adds nothing to the width.
       if (st->border_w > 0) {
@@ -1045,6 +1105,8 @@ static void paint_module(Bar *bar, const char *module, int tag,
           PIXMAN_OP_OVER, bg, &st->bg, 1,
           &(pixman_box32_t){.x1 = x1 * s, .x2 = x2 * s, .y1 = g_rt->bar_top * s,
                             .y2 = (g_rt->bar_top + buf_h) * s});
+      draw_box_shadows(bg, st->box_shadows, st->box_shadow_count, true,
+                       (int)x1, g_rt->bar_top, (int)(x2 - x1), (int)buf_h, s);
       if (st->border_w > 0) {
         uint32_t w = (uint32_t)st->border_w * s;
         uint32_t l = x1 * s, r = x2 * s;
@@ -1678,6 +1740,21 @@ static uint64_t style_sig(const ModuleStyle *st) {
                       ((uint64_t)st->border.green << 32) |
                       ((uint64_t)st->border.blue << 16) | st->border.alpha);
   h = hash_mix(h, (uint64_t)(uint32_t)st->border_w);
+  const struct {
+    const Shadow *list;
+    int count;
+  } lists[] = {{st->text_shadows, st->text_shadow_count},
+               {st->box_shadows, st->box_shadow_count}};
+  for (size_t l = 0; l < sizeof(lists) / sizeof(lists[0]); l++) {
+    h = hash_mix(h, (uint64_t)(uint32_t)lists[l].count);
+    for (int i = 0; i < lists[l].count; i++) {
+      const Shadow *s = &lists[l].list[i];
+      h = hash_mix(h, ((uint64_t)(uint32_t)s->x << 32) | (uint32_t)s->y);
+      h = hash_mix(h, ((uint64_t)(uint32_t)s->blur << 32) |
+                          (uint32_t)s->spread);
+      h = hash_mix(h, ((uint64_t)s->color << 1) | (s->inset ? 1u : 0u));
+    }
+  }
   return h;
 }
 
@@ -1741,10 +1818,14 @@ static void entry_signature(const Bar *bar, const ModuleEntry *e, char *ident,
 static pixman_image_t *render_entry_raster(Bar *bar, const LaidEntry *le,
                                            uint32_t y, uint32_t buf_h,
                                            int scale, int top) {
+  // The raster spans the whole height of the surface, so the shadows of a
+  // module reach above and below the row of the bar. Across the row it keeps
+  // the box of the module, and a neighbour paints over any overlap.
   int x0 = (int)(le->g.x0 * (uint32_t)scale);
   int x1 = (int)(le->g.paint * (uint32_t)scale);
-  int y0 = top * scale;
-  int h = (int)buf_h * scale;
+  int y0 = 0;
+  int h = (int)bar->height;
+  (void)top;
   if (x1 <= x0 || h <= 0)
     return NULL;
   int w = x1 - x0;
@@ -1810,9 +1891,11 @@ static void bar_free_layers(Bar *bar) {
     pixman_image_unref(bar->w_mask);
   if (bar->w_bg)
     pixman_image_unref(bar->w_bg);
+  if (bar->deco_under)
+    pixman_image_unref(bar->deco_under);
   if (bar->deco_over)
     pixman_image_unref(bar->deco_over);
-  bar->deco_over = NULL;
+  bar->deco_under = bar->deco_over = NULL;
   bar->deco_key = 0;
   bar->cache = NULL;
   bar->w_fg = bar->w_mask = bar->w_bg = NULL;
@@ -1955,23 +2038,40 @@ static uint64_t bar_deco_key(const Bar *bar, const ModuleStyle *bst,
   return hash_mix(h, (uint64_t)bar->scale);
 }
 
-// Paint the decoration of #bar that lies over the modules: the frame. The
-// layer covers the whole surface and stays clear outside the decoration.
-static void paint_bar_over(Bar *bar, const ModuleStyle *bst,
-                           uint32_t right_edge) {
-  if (!bar->deco_over ||
-      pixman_image_get_width(bar->deco_over) != (int)bar->width ||
-      pixman_image_get_height(bar->deco_over) != (int)bar->height) {
-    if (bar->deco_over)
-      pixman_image_unref(bar->deco_over);
-    bar->deco_over = pixman_image_create_bits(PIXMAN_a8r8g8b8, bar->width,
-                                              bar->height, NULL,
-                                              bar->width * 4);
-    if (!bar->deco_over)
-      return;
+// Make an image of the whole surface, or reuse one of the same size, and
+// clear it.
+static pixman_image_t *surface_layer(Bar *bar, pixman_image_t *img) {
+  if (img && (pixman_image_get_width(img) != (int)bar->width ||
+              pixman_image_get_height(img) != (int)bar->height)) {
+    pixman_image_unref(img);
+    img = NULL;
   }
-  clear_box(bar->deco_over, 0, 0, (int)bar->width, (int)bar->height);
-  if (bst->border_w <= 0 || right_edge <= g_rt->bar_left)
+  if (!img)
+    img = pixman_image_create_bits(PIXMAN_a8r8g8b8, bar->width, bar->height,
+                                   NULL, bar->width * 4);
+  if (img)
+    clear_box(img, 0, 0, (int)bar->width, (int)bar->height);
+  return img;
+}
+
+// Paint the decoration of #bar. The layer under the modules holds the outer
+// box shadows. The layer over them holds the inset box shadows and then the
+// frame, because #bar has no fill of its own under the modules.
+static void paint_bar_deco(Bar *bar, const ModuleStyle *bst,
+                           uint32_t right_edge) {
+  bar->deco_under = surface_layer(bar, bar->deco_under);
+  bar->deco_over = surface_layer(bar, bar->deco_over);
+  if (!bar->deco_under || !bar->deco_over || right_edge <= g_rt->bar_left)
+    return;
+  uint32_t scale = bar->scale > 0 ? (uint32_t)bar->scale : 1;
+  int bw_box = (int)(right_edge - g_rt->bar_left);
+  draw_box_shadows(bar->deco_under, bst->box_shadows, bst->box_shadow_count,
+                   false, (int)g_rt->bar_left, g_rt->bar_top, bw_box,
+                   (int)g_rt->bar_h, scale);
+  draw_box_shadows(bar->deco_over, bst->box_shadows, bst->box_shadow_count,
+                   true, (int)g_rt->bar_left, g_rt->bar_top, bw_box,
+                   (int)g_rt->bar_h, scale);
+  if (bst->border_w <= 0)
     return;
   cairo_surface_t *cs = cairo_image_surface_create_for_data(
       (unsigned char *)pixman_image_get_data(bar->deco_over),
@@ -1990,8 +2090,7 @@ static void paint_bar_over(Bar *bar, const ModuleStyle *bst,
   cairo_set_line_width(cr, bw);
   double rad = bst->radius > 0 ? bst->radius : 0;
   cairo_rounded_rect(cr, g_rt->bar_left + bw / 2.0, g_rt->bar_top + bw / 2.0,
-                     (double)(right_edge - g_rt->bar_left) - bw,
-                     (double)g_rt->bar_h - bw,
+                     (double)bw_box - bw, (double)g_rt->bar_h - bw,
                      rad > bw / 2.0 ? rad - bw / 2.0 : 0);
   cairo_stroke(cr);
   cairo_destroy(cr);
@@ -2247,7 +2346,7 @@ static void draw_bar(Bar *bar) {
   const ModuleStyle *bst = bar->sel ? &g_rt->st_bar_sel : &g_rt->st_bar;
   uint64_t deco_key = bar_deco_key(bar, bst, right_edge);
   if (!bar->deco_over || deco_key != bar->deco_key) {
-    paint_bar_over(bar, bst, right_edge);
+    paint_bar_deco(bar, bst, right_edge);
     bar->deco_key = deco_key;
     dirty_add(&dmg, 0, 0, (int)bar->width, (int)bar->height);
   }
@@ -2273,8 +2372,8 @@ static void draw_bar(Bar *bar) {
                     sizeof(ns->key));
     ns->x0 = le->g.x0 * (uint32_t)scale;
     ns->x1 = le->g.paint * (uint32_t)scale;
-    ns->y0 = (uint32_t)(top * scale);
-    ns->y1 = (uint32_t)((top + (int)buf_h) * scale);
+    ns->y0 = 0;
+    ns->y1 = bar->height;
     bool painted = ns->x1 > ns->x0 && ns->y1 > ns->y0;
 
     BarSlot *ps = NULL;
@@ -2333,6 +2432,8 @@ static void draw_bar(Bar *bar) {
 
   for (int r = 0; r < dmg.n; r++) {
     clear_box(bar->cache, dmg.x0[r], dmg.y0[r], dmg.x1[r], dmg.y1[r]);
+    blit_clipped(bar->deco_under, bar->cache, 0, 0, dmg.x0[r], dmg.y0[r],
+                 dmg.x1[r], dmg.y1[r]);
     if (mid_valid) {
       int x0 = mid_x0 > dmg.x0[r] ? mid_x0 : dmg.x0[r];
       int y0 = mid_y0 > dmg.y0[r] ? mid_y0 : dmg.y0[r];
@@ -2477,14 +2578,22 @@ static void bar_create_surface(Bar *bar) {
   // name arrived; keep that factor instead of starting over from 1.
   bar->scale = bar->wl_scale * bscale;
   bar->tag_count = cfg->tag_count;
-  bar->height = (rt->bar_h + rt->bar_top) * (uint32_t)bar->scale;
+  uint32_t surface_h = rt->bar_h + rt->bar_top + rt->shadow_reach;
+  bar->height = surface_h * (uint32_t)bar->scale;
   bar->wl_surface = wl_compositor_create_surface(compositor);
   bar->layer_surface = zwlr_layer_shell_v1_get_layer_surface(
       layer_shell, bar->wl_surface, bar->wl_output, cfg->layer, "mangobar");
   zwlr_layer_surface_v1_add_listener(bar->layer_surface,
                                      &layer_surface_listener, bar);
-  zwlr_layer_surface_v1_set_size(bar->layer_surface, 0,
-                                 rt->bar_h + rt->bar_top);
+  // The shadows below the bar get rows of their own. They reserve no space,
+  // and they take no pointer input, so a click there reaches the window.
+  zwlr_layer_surface_v1_set_size(bar->layer_surface, 0, surface_h);
+  if (rt->shadow_reach > 0) {
+    struct wl_region *input = wl_compositor_create_region(compositor);
+    wl_region_add(input, 0, 0, INT32_MAX, (int32_t)(rt->bar_h + rt->bar_top));
+    wl_surface_set_input_region(bar->wl_surface, input);
+    wl_region_destroy(input);
+  }
   zwlr_layer_surface_v1_set_anchor(bar->layer_surface,
                                    ZWLR_LAYER_SURFACE_V1_ANCHOR_TOP |
                                        ZWLR_LAYER_SURFACE_V1_ANCHOR_LEFT |
@@ -5112,6 +5221,10 @@ static void apply_css_resolved(ModuleStyle *ms, Style s) {
     memcpy(ms->text_shadows, s.text_shadows, sizeof(ms->text_shadows));
     ms->text_shadow_count = s.text_shadow_count;
   }
+  if (s.box_shadow_set) {
+    memcpy(ms->box_shadows, s.box_shadows, sizeof(ms->box_shadows));
+    ms->box_shadow_count = s.box_shadow_count;
+  }
 }
 
 static void apply_css(ModuleStyle *ms, const char *module, const char *state) {
@@ -5260,6 +5373,7 @@ static void init_profile_styles(ProfileRuntime *rt, MangoConfigProfile *profile)
   rt->bar_left = bar_s.margin_left_set ? (uint32_t)bar_s.margin_left : 0;
   rt->bar_right = bar_s.margin_right_set ? (uint32_t)bar_s.margin_right : 0;
   rt->bar_h = (uint32_t)profile->config.bar_height;
+  rt->shadow_reach = (uint32_t)style_sheet_shadow_reach(&g_style_sheet);
 }
 
 int main(int argc, char **argv) {

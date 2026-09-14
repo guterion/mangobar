@@ -8,14 +8,16 @@
 #define MANGOBAR_MAX_STYLE_RULES 128
 #define MANGOBAR_MAX_SELECTORS 16
 #define MANGOBAR_MAX_VARS 64
-#define MANGOBAR_MAX_TEXT_SHADOWS 4
+#define MANGOBAR_MAX_SHADOWS 4
 
-// One layer of text-shadow
+// One layer of text-shadow or box-shadow
 typedef struct {
     int x, y; // offset in pixels
     int blur; // blur radius in pixels; 0 = hard edge
+    int spread; // box-shadow only: growth of the box in pixels
     uint32_t color; // same format as Style.color
-} TextShadow;
+    bool inset; // box-shadow only: the shadow falls inside the box
+} Shadow;
 
 // Single style declaration block
 typedef struct {
@@ -26,8 +28,10 @@ typedef struct {
     bool bg_gradient; // background is a linear gradient (start = background)
     uint32_t border_color; // ARGB border (menu, bar and modules)
     int border_width; // border thickness in pixels; 0 = none
-    TextShadow text_shadows[MANGOBAR_MAX_TEXT_SHADOWS]; // the first lies on top
+    Shadow text_shadows[MANGOBAR_MAX_SHADOWS]; // the first lies on top
     int text_shadow_count;
+    Shadow box_shadows[MANGOBAR_MAX_SHADOWS]; // the first lies on top
+    int box_shadow_count;
     int padding_left;
     int padding_right;
     int margin_top;
@@ -40,6 +44,7 @@ typedef struct {
     bool border_color_set;
     bool border_width_set;
     bool text_shadow_set;
+    bool box_shadow_set;
     bool padding_left_set;
     bool padding_right_set;
     bool margin_top_set;
@@ -87,6 +92,10 @@ int style_sheet_parse(StyleSheet *ss, const char *buf);
 
 // Resolve final style for module+state in cascade order:
 // "*", "#module", "#module.state"; later rules override earlier ones
+// The distance in pixels that the outer box shadows of the sheet reach below
+// the box that casts them. The bar surface grows down by this distance.
+int style_sheet_shadow_reach(const StyleSheet *ss);
+
 Style style_resolve(const StyleSheet *ss, const char *module, const char *state);
 
 // Resolve only the #module / #module.state rules (skip "*"), so aliases like

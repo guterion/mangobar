@@ -344,11 +344,12 @@ static void parse_int_pair(const char *s, int *a, int *b) {
     *b = *a;
 }
 
-// Parse one layer of text-shadow: two or three lengths and a color, in either
-// order. A parenthesised group such as mix(a, b, t) counts as one token.
-static bool parse_text_shadow(StyleSheet *ss, const char *item,
-                              TextShadow *out) {
-  int lengths[3] = {0, 0, 0};
+// Parse one shadow layer: two to four lengths, a color and, for a box, the
+// inset keyword, in any order. text-shadow takes three lengths at the most.
+// A parenthesised group such as mix(a, b, t) counts as one token.
+static bool parse_shadow(StyleSheet *ss, const char *item, bool box,
+                         Shadow *out) {
+  int lengths[5] = {0, 0, 0, 0, 0};
   int nlen = 0;
   bool have_color = false;
   const char *p = item;
@@ -379,20 +380,54 @@ static bool parse_text_shadow(StyleSheet *ss, const char *item,
     uint32_t c;
     if (number) {
       // parse_int reads the digits alone, so the sign is taken here.
-      if (nlen < 3)
+      if (nlen < 5)
         lengths[nlen++] = tok[0] == '-' ? -parse_int(tok + 1) : parse_int(tok);
+    } else if (strcmp(tok, "inset") == 0) {
+      out->inset = true;
     } else if (resolve_color_value(ss, tok, color_buf, sizeof(color_buf)) &&
                parse_hex_color(color_buf, &c)) {
       out->color = c;
       have_color = true;
     }
   }
-  if (!have_color || nlen < 2)
+  if (!have_color || nlen < 2 || nlen > (box ? 4 : 3) || (out->inset && !box))
     return false;
   out->x = lengths[0];
   out->y = lengths[1];
   out->blur = nlen > 2 && lengths[2] > 0 ? lengths[2] : 0;
+  out->spread = lengths[3];
   return true;
+}
+
+// Parse a list of shadow layers separated by commas outside parentheses.
+// The whole list replaces the list that a wider rule set.
+static void parse_shadow_list(StyleSheet *ss, const char *val, bool box,
+                              Shadow *out, int *count, bool *set) {
+  *count = 0;
+  *set = true;
+  const char *p = val;
+  while (*p && *count < MANGOBAR_MAX_SHADOWS) {
+    const char *start = p;
+    int depth = 0;
+    while (*p && (depth > 0 || *p != ',')) {
+      if (*p == '(')
+        depth++;
+      else if (*p == ')' && depth > 0)
+        depth--;
+      p++;
+    }
+    char item[256];
+    size_t n = (size_t)(p - start);
+    if (n >= sizeof(item))
+      n = sizeof(item) - 1;
+    memcpy(item, start, n);
+    item[n] = '\0';
+    Shadow sh = {0};
+    if (strstr(item, "none") == NULL && parse_shadow(ss, item, box, &sh))
+      out[(*count)++] = sh;
+    if (*p == ',')
+      p++;
+  }
 }
 
 static void apply_decl(StyleSheet *ss, Style *st, const char *prop,
@@ -449,33 +484,11 @@ static void apply_decl(StyleSheet *ss, Style *st, const char *prop,
       }
     }
   } else if (strcmp(prop, "text-shadow") == 0) {
-    // A list of layers separated by commas outside parentheses. The whole
-    // list replaces the list that a wider rule set.
-    st->text_shadow_count = 0;
-    st->text_shadow_set = true;
-    const char *p = val;
-    while (*p && st->text_shadow_count < MANGOBAR_MAX_TEXT_SHADOWS) {
-      const char *start = p;
-      int depth = 0;
-      while (*p && (depth > 0 || *p != ',')) {
-        if (*p == '(')
-          depth++;
-        else if (*p == ')' && depth > 0)
-          depth--;
-        p++;
-      }
-      char item[256];
-      size_t n = (size_t)(p - start);
-      if (n >= sizeof(item))
-        n = sizeof(item) - 1;
-      memcpy(item, start, n);
-      item[n] = '\0';
-      TextShadow sh = {0};
-      if (strstr(item, "none") == NULL && parse_text_shadow(ss, item, &sh))
-        st->text_shadows[st->text_shadow_count++] = sh;
-      if (*p == ',')
-        p++;
-    }
+    parse_shadow_list(ss, val, false, st->text_shadows, &st->text_shadow_count,
+                      &st->text_shadow_set);
+  } else if (strcmp(prop, "box-shadow") == 0) {
+    parse_shadow_list(ss, val, true, st->box_shadows, &st->box_shadow_count,
+                      &st->box_shadow_set);
   } else if (strcmp(prop, "border-radius") == 0) {
     st->radius = parse_int(val);
     st->radius_set = true;
@@ -816,6 +829,10 @@ static void apply_rule(Style *dst, const StyleRule *r) {
     memcpy(dst->text_shadows, s->text_shadows, sizeof(dst->text_shadows));
     dst->text_shadow_count = s->text_shadow_count;
   }
+  if (s->box_shadow_set) {
+    memcpy(dst->box_shadows, s->box_shadows, sizeof(dst->box_shadows));
+    dst->box_shadow_count = s->box_shadow_count;
+  }
   if (s->padding_left_set)
     dst->padding_left = s->padding_left;
   if (s->padding_right_set)
@@ -835,6 +852,7 @@ static void apply_rule(Style *dst, const StyleRule *r) {
   dst->border_color_set |= s->border_color_set;
   dst->border_width_set |= s->border_width_set;
   dst->text_shadow_set |= s->text_shadow_set;
+  dst->box_shadow_set |= s->box_shadow_set;
   dst->padding_left_set |= s->padding_left_set;
   dst->padding_right_set |= s->padding_right_set;
   dst->margin_top_set |= s->margin_top_set;
@@ -940,4 +958,18 @@ int style_find_default_path(char *out, size_t outsz) {
     }
   }
   return -1;
+}
+
+int style_sheet_shadow_reach(const StyleSheet *ss) {
+  int reach = 0;
+  for (int i = 0; i < ss->rule_count; i++) {
+    const Style *s = &ss->rules[i].style;
+    for (int j = 0; j < s->box_shadow_count; j++) {
+      const Shadow *sh = &s->box_shadows[j];
+      int r = sh->y + sh->spread + sh->blur;
+      if (!sh->inset && r > reach)
+        reach = r;
+    }
+  }
+  return reach;
 }

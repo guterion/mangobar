@@ -16,7 +16,8 @@ typedef struct {
     uint32_t gradient_end; // ARGB end color for linear-gradient backgrounds
     int gradient_dir; // 0=to bottom (default) 1=to top 2=to left 3=to right
     bool bg_gradient; // background is a linear gradient (start = background)
-    uint32_t border_color; // ARGB border (menu)
+    uint32_t border_color; // ARGB border (menu, bar and modules)
+    int border_width; // border thickness in pixels; 0 = none
     int padding_left;
     int padding_right;
     int margin_top;
@@ -27,6 +28,7 @@ typedef struct {
     bool color_set;
     bool background_set;
     bool border_color_set;
+    bool border_width_set;
     bool padding_left_set;
     bool padding_right_set;
     bool margin_top_set;

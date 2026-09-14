@@ -200,6 +200,8 @@ typedef struct {
   int radius; // -1=pill, >=0 explicit radius (0=square)
   int min_width; // minimum module width
   bool center; // center text (tag buttons)
+  pixman_color_t border;
+  int border_w; // border thickness; 0 = none
 } ModuleStyle;
 
 static void apply_css_resolved(ModuleStyle *ms, Style s);
@@ -565,6 +567,10 @@ typedef struct Bar {
   bool mid_painted;
   int mid_x0, mid_x1;
   uint64_t mid_key;
+  // The decoration of #bar that lies over the modules, and the key of the
+  // style and geometry that painted it.
+  pixman_image_t *deco_over;
+  uint64_t deco_key;
   DirtyList dirty;
   struct wl_buffer *buf[MANGOBAR_BUF_POOL];
   void *buf_data[MANGOBAR_BUF_POOL];
@@ -964,12 +970,37 @@ static void paint_module(Bar *bar, const char *module, int tag,
       cairo_fill(bar_bg_cr);
       if (pat)
         cairo_pattern_destroy(pat);
+      // The border lies inside the module box, so it follows the radius
+      // and adds nothing to the width.
+      if (st->border_w > 0) {
+        double bw = st->border_w;
+        double r, g, b, a;
+        pixman_color_to_doubles(&st->border, &r, &g, &b, &a);
+        cairo_set_source_rgba(bar_bg_cr, r, g, b, a);
+        cairo_set_line_width(bar_bg_cr, bw);
+        cairo_rounded_rect(bar_bg_cr, x1 + bw / 2.0, g_rt->bar_top + bw / 2.0,
+                           (double)(x2 - x1) - bw, (double)buf_h - bw,
+                           rad > bw / 2.0 ? rad - bw / 2.0 : 0);
+        cairo_stroke(bar_bg_cr);
+      }
     } else {
       uint32_t s = g_draw_scale > 0 ? g_draw_scale : 1;
       pixman_image_fill_boxes(
           PIXMAN_OP_OVER, bg, &st->bg, 1,
           &(pixman_box32_t){.x1 = x1 * s, .x2 = x2 * s, .y1 = g_rt->bar_top * s,
                             .y2 = (g_rt->bar_top + buf_h) * s});
+      if (st->border_w > 0) {
+        uint32_t w = (uint32_t)st->border_w * s;
+        uint32_t l = x1 * s, r = x2 * s;
+        uint32_t t = g_rt->bar_top * s, b = (g_rt->bar_top + buf_h) * s;
+        pixman_image_fill_boxes(PIXMAN_OP_OVER, bg, &st->border, 4,
+                                (pixman_box32_t[]){
+                                    {.x1 = l, .x2 = r, .y1 = t, .y2 = t + w},
+                                    {.x1 = l, .x2 = r, .y1 = b - w, .y2 = b},
+                                    {.x1 = l, .x2 = l + w, .y1 = t + w, .y2 = b - w},
+                                    {.x1 = r - w, .x2 = r, .y1 = t + w, .y2 = b - w},
+                                });
+      }
     }
     uint32_t text_x = x1 + st->pad_l;
     if (st->center) {
@@ -1578,6 +1609,10 @@ static uint64_t style_sig(const ModuleStyle *st) {
                       (uint64_t)(uint32_t)st->margin_r);
   h = hash_mix(h, ((uint64_t)(uint32_t)st->radius << 32) |
                       (uint64_t)(uint32_t)st->min_width);
+  h = hash_mix(h, ((uint64_t)st->border.red << 48) |
+                      ((uint64_t)st->border.green << 32) |
+                      ((uint64_t)st->border.blue << 16) | st->border.alpha);
+  h = hash_mix(h, (uint64_t)(uint32_t)st->border_w);
   return h;
 }
 
@@ -1710,6 +1745,10 @@ static void bar_free_layers(Bar *bar) {
     pixman_image_unref(bar->w_mask);
   if (bar->w_bg)
     pixman_image_unref(bar->w_bg);
+  if (bar->deco_over)
+    pixman_image_unref(bar->deco_over);
+  bar->deco_over = NULL;
+  bar->deco_key = 0;
   bar->cache = NULL;
   bar->w_fg = bar->w_mask = bar->w_bg = NULL;
   bar->cache_w = bar->cache_h = 0;
@@ -1839,6 +1878,59 @@ static bool bar_commit(Bar *bar, const DirtyList *dmg) {
   bar->buf_busy[idx] = true;
   bar->buf_next = (idx + 1) % MANGOBAR_BUF_POOL;
   return true;
+}
+
+// The key of the decoration of #bar: its style and the box of the bar.
+static uint64_t bar_deco_key(const Bar *bar, const ModuleStyle *bst,
+                             uint32_t right_edge) {
+  uint64_t h = style_sig(bst);
+  h = hash_mix(h, ((uint64_t)g_rt->bar_left << 32) | right_edge);
+  h = hash_mix(h, ((uint64_t)(uint32_t)g_rt->bar_top << 32) | g_rt->bar_h);
+  h = hash_mix(h, ((uint64_t)bar->width << 32) | bar->height);
+  return hash_mix(h, (uint64_t)bar->scale);
+}
+
+// Paint the decoration of #bar that lies over the modules: the frame. The
+// layer covers the whole surface and stays clear outside the decoration.
+static void paint_bar_over(Bar *bar, const ModuleStyle *bst,
+                           uint32_t right_edge) {
+  if (!bar->deco_over ||
+      pixman_image_get_width(bar->deco_over) != (int)bar->width ||
+      pixman_image_get_height(bar->deco_over) != (int)bar->height) {
+    if (bar->deco_over)
+      pixman_image_unref(bar->deco_over);
+    bar->deco_over = pixman_image_create_bits(PIXMAN_a8r8g8b8, bar->width,
+                                              bar->height, NULL,
+                                              bar->width * 4);
+    if (!bar->deco_over)
+      return;
+  }
+  clear_box(bar->deco_over, 0, 0, (int)bar->width, (int)bar->height);
+  if (bst->border_w <= 0 || right_edge <= g_rt->bar_left)
+    return;
+  cairo_surface_t *cs = cairo_image_surface_create_for_data(
+      (unsigned char *)pixman_image_get_data(bar->deco_over),
+      CAIRO_FORMAT_ARGB32, bar->width, bar->height, bar->width * 4);
+  if (cairo_surface_status(cs) != CAIRO_STATUS_SUCCESS) {
+    cairo_surface_destroy(cs);
+    return;
+  }
+  cairo_t *cr = cairo_create(cs);
+  cairo_scale(cr, bar->scale, bar->scale);
+  cairo_set_antialias(cr, CAIRO_ANTIALIAS_BEST);
+  double bw = bst->border_w;
+  double r, g, b, a;
+  pixman_color_to_doubles(&bst->border, &r, &g, &b, &a);
+  cairo_set_source_rgba(cr, r, g, b, a);
+  cairo_set_line_width(cr, bw);
+  double rad = bst->radius > 0 ? bst->radius : 0;
+  cairo_rounded_rect(cr, g_rt->bar_left + bw / 2.0, g_rt->bar_top + bw / 2.0,
+                     (double)(right_edge - g_rt->bar_left) - bw,
+                     (double)g_rt->bar_h - bw,
+                     rad > bw / 2.0 ? rad - bw / 2.0 : 0);
+  cairo_stroke(cr);
+  cairo_destroy(cr);
+  cairo_surface_destroy(cs);
 }
 
 static void draw_bar(Bar *bar) {
@@ -2085,6 +2177,16 @@ static void draw_bar(Bar *bar) {
   if (bar->paint_all)
     dirty_add(&dmg, 0, 0, (int)bar->width, (int)bar->height);
 
+  // The decoration of #bar lies over the whole row, so a new decoration
+  // repaints the whole surface.
+  const ModuleStyle *bst = bar->sel ? &g_rt->st_bar_sel : &g_rt->st_bar;
+  uint64_t deco_key = bar_deco_key(bar, bst, right_edge);
+  if (!bar->deco_over || deco_key != bar->deco_key) {
+    paint_bar_over(bar, bst, right_edge);
+    bar->deco_key = deco_key;
+    dirty_add(&dmg, 0, 0, (int)bar->width, (int)bar->height);
+  }
+
   if (mid_valid != bar->mid_painted || mid_key != bar->mid_key ||
       (mid_valid && (mid_x0 != bar->mid_x0 || mid_x1 != bar->mid_x1))) {
     if (bar->mid_painted)
@@ -2178,6 +2280,8 @@ static void draw_bar(Bar *bar) {
     for (int i = 0; i < next_n; i++)
       blit_clipped(next[i].raster, bar->cache, (int)next[i].x0,
                    (int)next[i].y0, dmg.x0[r], dmg.y0[r], dmg.x1[r], dmg.y1[r]);
+    blit_clipped(bar->deco_over, bar->cache, 0, 0, dmg.x0[r], dmg.y0[r],
+                 dmg.x1[r], dmg.y1[r]);
   }
 
   if (getenv("MANGOBAR_DUMPPNG") && (bar->atags || bar->ctags) && dmg.n > 0) {
@@ -4935,6 +5039,10 @@ static void apply_css_resolved(ModuleStyle *ms, Style s) {
     ms->radius = s.radius;
   if (s.min_width_set)
     ms->min_width = s.min_width;
+  if (s.border_color_set)
+    hex_to_pixman(s.border_color, &ms->border);
+  if (s.border_width_set)
+    ms->border_w = s.border_width;
 }
 
 static void apply_css(ModuleStyle *ms, const char *module, const char *state) {

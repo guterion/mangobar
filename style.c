@@ -374,6 +374,29 @@ static void apply_decl(StyleSheet *ss, Style *st, const char *prop,
              parse_hex_color(color_buf, &c)) {
     st->border_color = c;
     st->border_color_set = true;
+  } else if (strcmp(prop, "border-width") == 0) {
+    st->border_width = parse_int(val);
+    st->border_width_set = true;
+  } else if (strcmp(prop, "border") == 0) {
+    // Width, style and color may come in any order; the style keyword is
+    // read and ignored, because the border is always solid.
+    char buf[128];
+    snprintf(buf, sizeof(buf), "%s", val);
+    char *save = NULL;
+    for (char *tok = strtok_r(buf, " \t", &save); tok;
+         tok = strtok_r(NULL, " \t", &save)) {
+      if (strcmp(tok, "none") == 0) {
+        st->border_width = 0;
+        st->border_width_set = true;
+      } else if (isdigit((unsigned char)tok[0])) {
+        st->border_width = parse_int(tok);
+        st->border_width_set = true;
+      } else if (resolve_color_value(ss, tok, color_buf, sizeof(color_buf)) &&
+                 parse_hex_color(color_buf, &c)) {
+        st->border_color = c;
+        st->border_color_set = true;
+      }
+    }
   } else if (strcmp(prop, "border-radius") == 0) {
     st->radius = parse_int(val);
     st->radius_set = true;
@@ -708,6 +731,8 @@ static void apply_rule(Style *dst, const StyleRule *r) {
   }
   if (s->border_color_set)
     dst->border_color = s->border_color;
+  if (s->border_width_set)
+    dst->border_width = s->border_width;
   if (s->padding_left_set)
     dst->padding_left = s->padding_left;
   if (s->padding_right_set)
@@ -725,6 +750,7 @@ static void apply_rule(Style *dst, const StyleRule *r) {
   dst->color_set |= s->color_set;
   dst->background_set |= s->background_set;
   dst->border_color_set |= s->border_color_set;
+  dst->border_width_set |= s->border_width_set;
   dst->padding_left_set |= s->padding_left_set;
   dst->padding_right_set |= s->padding_right_set;
   dst->margin_top_set |= s->margin_top_set;

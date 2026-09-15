@@ -1687,6 +1687,10 @@ static void fit_text_width(const char *text, char *out, size_t outsz,
 static uint32_t module_entry_width(const ModuleEntry *e) {
   if (e->is_tray)
     return e->width;
+  // draw_module draws nothing for an entry without text, so the entry takes
+  // no room in its group.
+  if (!e->text || !*e->text)
+    return 0;
   int32_t mn, mx;
   uint32_t tw = text_metrics(e->text, &mn, &mx);
   uint32_t body = tw + e->st->pad_l + e->st->pad_r;

@@ -992,9 +992,13 @@ static uint32_t draw_text(const char *text, uint32_t x, uint32_t y,
         pixman_image_composite32(PIXMAN_OP_OVER, g->pix, NULL, fg, 0, 0, 0, 0,
                                  gx, (int32_t)dy - g->y, g->width, g->height);
       } else {
+        // The colour covers the whole height of the image. The bar starts
+        // at its top margin, so a column of buf_h rows would leave the
+        // lower part of a glyph without colour, and that part shows black.
         pixman_image_fill_boxes(
             PIXMAN_OP_OVER, fg, fg_color, 1,
-            &(pixman_box32_t){.x1 = gx, .x2 = gx2, .y1 = 0, .y2 = (int32_t)dbuf});
+            &(pixman_box32_t){.x1 = gx, .x2 = gx2, .y1 = 0,
+                              .y2 = pixman_image_get_height(fg)});
       }
       pixman_image_t *mask = pixman_image_create_solid_fill(
           &(pixman_color_t){0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF});
@@ -1005,7 +1009,8 @@ static uint32_t draw_text(const char *text, uint32_t x, uint32_t y,
     if (bg && bg_color)
       pixman_image_fill_boxes(
           PIXMAN_OP_OVER, bg, bg_color, 1,
-          &(pixman_box32_t){.x1 = gx, .x2 = gx2, .y1 = 0, .y2 = (int32_t)dbuf});
+          &(pixman_box32_t){.x1 = gx, .x2 = gx2, .y1 = 0,
+                            .y2 = pixman_image_get_height(bg)});
     pen += g->advance.x;
   }
   return (uint32_t)(pen - mn);

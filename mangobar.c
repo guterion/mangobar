@@ -2807,6 +2807,7 @@ static void registry_global(void *data, struct wl_registry *registry,
 
 // Called when the menu/popup state references an output that is going away.
 static void menu_output_removed(struct wl_output *output);
+static void tooltip_output_removed(struct wl_output *output);
 
 static void registry_global_remove(void *data, struct wl_registry *registry,
                                    uint32_t name) {
@@ -2818,6 +2819,7 @@ static void registry_global_remove(void *data, struct wl_registry *registry,
     if (pointer_bar == bar)
       pointer_bar = NULL;
     menu_output_removed(bar->wl_output);
+    tooltip_output_removed(bar->wl_output);
     // Destroy Wayland resources.
     bar_destroy_surface(bar);
     if (bar->xdg_output)
@@ -4137,6 +4139,375 @@ static void menu_open(Bar *bar, MangobarTrayItem *item, double lx, double ly) {
   menu_refresh(popup.menu);
 }
 
+// ---------- Hover tooltip ----------
+// A hover on a module with a tooltip opens a layer-shell popup after a
+// short delay. The content is the `tooltip` field of the Waybar-style JSON
+// that a custom module prints. Pango markup is supported and falls back
+// to plain text when the markup does not parse.
+
+#define TOOLTIP_HOVER_DELAY_MS 500
+#define TOOLTIP_DEFAULT_MAX_WIDTH 480
+#define TOOLTIP_DEFAULT_RADIUS 6
+#define TOOLTIP_DEFAULT_PADDING 10
+
+typedef struct {
+  Bar *bar;
+  char module[64]; // the module currently queued or shown
+  uint64_t hover_since; // 0 = not pending
+  bool shown;
+  bool configured;
+  struct wl_surface *surface;
+  struct zwlr_layer_surface_v1 *layer_surface;
+  int scale;
+  uint32_t width, height; // logical
+  uint32_t buf_width, buf_height, stride, bufsize;
+  int anchor_cx; // module centre in bar logical coords
+  int body_w, body_h; // required layout size in logical pixels
+  int pad_l, pad_r, pad_t, pad_b;
+  int radius;
+  int max_w;
+  char body[4096]; // the markup we drew
+  Style style;
+} Tooltip;
+static Tooltip tt;
+
+static PangoFontDescription *build_tooltip_font(void) {
+  PangoFontDescription *fd = build_menu_font();
+  if (g_style_sheet.tooltip_font_size > 0)
+    pango_font_description_set_size(
+        fd, g_style_sheet.tooltip_font_size * PANGO_SCALE);
+  return fd;
+}
+
+// Find the custom module that drives this bar module name, if any. The
+// hover_module field holds "custom-<name>" for a custom module.
+static const MangoCustomModule *tooltip_lookup_custom(const Bar *bar,
+                                                     const char *module) {
+  if (!bar || !bar->profile || !module || strncmp(module, "custom-", 7) != 0)
+    return NULL;
+  const char *tail = module + 7;
+  const MangoConfig *cfg = &bar->profile->config;
+  for (int i = 0; i < cfg->custom_count; i++) {
+    if (strcmp(cfg->customs[i].name, tail) == 0)
+      return &cfg->customs[i];
+  }
+  return NULL;
+}
+
+// Find the body shown in the tooltip for the given module.
+static const char *tooltip_body_for(const Bar *bar, const char *module) {
+  const MangoCustomModule *cm = tooltip_lookup_custom(bar, module);
+  if (cm && cm->tooltip[0])
+    return cm->tooltip;
+  return NULL;
+}
+
+// Return the centre of the hotspot that covers this module (logical coords).
+static int tooltip_module_centre(const Bar *bar, const char *module) {
+  for (int i = 0; i < bar->hotspot_count; i++) {
+    const Hotspot *h = &bar->hotspots[i];
+    if (strcmp(h->module, module) == 0)
+      return (int)(h->x1 + h->x2) / 2;
+  }
+  return (int)bar->logical_w / 2;
+}
+
+static void tooltip_destroy_surface(void) {
+  if (tt.layer_surface) {
+    zwlr_layer_surface_v1_destroy(tt.layer_surface);
+    tt.layer_surface = NULL;
+  }
+  if (tt.surface) {
+    wl_surface_destroy(tt.surface);
+    tt.surface = NULL;
+  }
+  tt.shown = false;
+  tt.configured = false;
+  tt.body[0] = '\0';
+}
+
+static void tooltip_hide(void) {
+  tt.hover_since = 0;
+  tt.module[0] = '\0';
+  tt.bar = NULL;
+  tooltip_destroy_surface();
+}
+
+// Measure the Pango layout for the current body, respecting the maximum
+// width. Fills tt.body_w and tt.body_h in logical pixels.
+static void tooltip_measure(void) {
+  cairo_surface_t *cs = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, 1, 1);
+  cairo_t *cr = cairo_create(cs);
+  PangoLayout *l = pango_cairo_create_layout(cr);
+  PangoFontDescription *fd = build_tooltip_font();
+  pango_layout_set_font_description(l, fd);
+  pango_font_description_free(fd);
+  pango_layout_set_width(l, tt.max_w * PANGO_SCALE);
+  pango_layout_set_wrap(l, PANGO_WRAP_WORD_CHAR);
+  PangoAttrList *attrs = NULL;
+  char *plain = NULL;
+  GError *err = NULL;
+  if (pango_parse_markup(tt.body, -1, 0, &attrs, &plain, NULL, &err)) {
+    pango_layout_set_text(l, plain, -1);
+    if (attrs)
+      pango_layout_set_attributes(l, attrs);
+  } else {
+    if (err)
+      g_error_free(err);
+    pango_layout_set_text(l, tt.body, -1);
+  }
+  int w, h;
+  pango_layout_get_pixel_size(l, &w, &h);
+  tt.body_w = w;
+  tt.body_h = h;
+  if (attrs)
+    pango_attr_list_unref(attrs);
+  if (plain)
+    g_free(plain);
+  g_object_unref(l);
+  cairo_destroy(cr);
+  cairo_surface_destroy(cs);
+}
+
+static void tooltip_draw(void) {
+  if (!tt.shown || !tt.configured)
+    return;
+  int fd = allocate_shm_file(tt.bufsize);
+  if (fd < 0)
+    return;
+  uint32_t *data = mmap(NULL, tt.bufsize, PROT_READ | PROT_WRITE, MAP_SHARED,
+                        fd, 0);
+  if (data == MAP_FAILED) {
+    close(fd);
+    return;
+  }
+  struct wl_shm_pool *pool = wl_shm_create_pool(shm, fd, tt.bufsize);
+  struct wl_buffer *buf = wl_shm_pool_create_buffer(
+      pool, 0, tt.buf_width, tt.buf_height, tt.stride,
+      WL_SHM_FORMAT_ARGB8888);
+  wl_buffer_add_listener(buf, &wl_buffer_listener, NULL);
+  wl_shm_pool_destroy(pool);
+  close(fd);
+
+  cairo_surface_t *cs = cairo_image_surface_create_for_data(
+      (unsigned char *)data, CAIRO_FORMAT_ARGB32, tt.buf_width, tt.buf_height,
+      tt.stride);
+  cairo_t *cr = cairo_create(cs);
+  cairo_scale(cr, tt.scale, tt.scale);
+  cairo_set_antialias(cr, CAIRO_ANTIALIAS_BEST);
+
+  double bg_r = 0.125, bg_g = 0.106, bg_b = 0.078, bg_a = 0.97;
+  double fg_r = 0.78, fg_g = 0.77, fg_b = 0.72;
+  double bd_r = 0.27, bd_g = 0.27, bd_b = 0.27;
+  double bd_a = 1.0;
+  if (tt.style.background_set) {
+    uint32_t bgc = tt.style.background;
+    bg_r = ((bgc >> 24) & 0xff) / 255.0;
+    bg_g = ((bgc >> 16) & 0xff) / 255.0;
+    bg_b = ((bgc >> 8) & 0xff) / 255.0;
+    bg_a = (bgc & 0xff) / 255.0;
+  }
+  if (tt.style.color_set) {
+    uint32_t fgc = tt.style.color;
+    fg_r = ((fgc >> 24) & 0xff) / 255.0;
+    fg_g = ((fgc >> 16) & 0xff) / 255.0;
+    fg_b = ((fgc >> 8) & 0xff) / 255.0;
+  }
+  if (tt.style.border_color_set) {
+    uint32_t bc = tt.style.border_color;
+    bd_r = ((bc >> 24) & 0xff) / 255.0;
+    bd_g = ((bc >> 16) & 0xff) / 255.0;
+    bd_b = ((bc >> 8) & 0xff) / 255.0;
+    bd_a = (bc & 0xff) / 255.0;
+  }
+
+  int bw = tt.style.border_width_set && tt.style.border_width > 0
+               ? tt.style.border_width
+               : 0;
+  cairo_rounded_rect(cr, 0, 0, tt.width, tt.height, tt.radius);
+  cairo_set_source_rgba(cr, bg_r, bg_g, bg_b, bg_a);
+  cairo_fill_preserve(cr);
+  if (bw > 0) {
+    cairo_set_source_rgba(cr, bd_r, bd_g, bd_b, bd_a);
+    cairo_set_line_width(cr, bw);
+    cairo_stroke(cr);
+  } else {
+    cairo_new_path(cr);
+  }
+
+  PangoLayout *l = pango_cairo_create_layout(cr);
+  PangoFontDescription *fd2 = build_tooltip_font();
+  pango_layout_set_font_description(l, fd2);
+  pango_font_description_free(fd2);
+  pango_layout_set_width(l, tt.max_w * PANGO_SCALE);
+  pango_layout_set_wrap(l, PANGO_WRAP_WORD_CHAR);
+  PangoAttrList *attrs = NULL;
+  char *plain = NULL;
+  if (pango_parse_markup(tt.body, -1, 0, &attrs, &plain, NULL, NULL)) {
+    pango_layout_set_text(l, plain, -1);
+    if (attrs)
+      pango_layout_set_attributes(l, attrs);
+  } else {
+    pango_layout_set_text(l, tt.body, -1);
+  }
+  cairo_move_to(cr, tt.pad_l, tt.pad_t);
+  cairo_set_source_rgb(cr, fg_r, fg_g, fg_b);
+  pango_cairo_show_layout(cr, l);
+  if (attrs)
+    pango_attr_list_unref(attrs);
+  if (plain)
+    g_free(plain);
+  g_object_unref(l);
+
+  cairo_destroy(cr);
+  cairo_surface_destroy(cs);
+  munmap(data, tt.bufsize);
+
+  wl_surface_attach(tt.surface, buf, 0, 0);
+  wl_surface_damage_buffer(tt.surface, 0, 0, tt.buf_width, tt.buf_height);
+  wl_surface_commit(tt.surface);
+}
+
+static void tooltip_layer_configure(void *data,
+                                    struct zwlr_layer_surface_v1 *surface,
+                                    uint32_t serial, uint32_t w, uint32_t h) {
+  (void)data;
+  zwlr_layer_surface_v1_ack_configure(surface, serial);
+  tt.width = w;
+  tt.height = h;
+  uint32_t s = tt.scale > 0 ? (uint32_t)tt.scale : 1;
+  tt.buf_width = w * s;
+  tt.buf_height = h * s;
+  tt.stride = tt.buf_width * 4;
+  tt.bufsize = tt.stride * tt.buf_height;
+  tt.configured = true;
+  tooltip_draw();
+}
+
+static void tooltip_layer_closed(void *data,
+                                 struct zwlr_layer_surface_v1 *surface) {
+  (void)data;
+  (void)surface;
+  tooltip_hide();
+}
+
+static const struct zwlr_layer_surface_v1_listener tooltip_layer_listener = {
+    .configure = tooltip_layer_configure,
+    .closed = tooltip_layer_closed,
+};
+
+static void tooltip_show(Bar *bar, const char *module, const char *body) {
+  tooltip_destroy_surface();
+  tt.bar = bar;
+  // Both module and body may alias members of tt (tooltip_tick calls here
+  // with tt.module and the custom module's tooltip buffer), so use memmove.
+  size_t mlen = strlen(module);
+  if (mlen >= sizeof(tt.module))
+    mlen = sizeof(tt.module) - 1;
+  memmove(tt.module, module, mlen);
+  tt.module[mlen] = '\0';
+  size_t blen = strlen(body);
+  if (blen >= sizeof(tt.body))
+    blen = sizeof(tt.body) - 1;
+  memmove(tt.body, body, blen);
+  tt.body[blen] = '\0';
+  tt.style = style_resolve_tooltip(&g_style_sheet, module);
+  tt.radius = g_style_sheet.tooltip_radius > 0 ? g_style_sheet.tooltip_radius
+                                               : TOOLTIP_DEFAULT_RADIUS;
+  tt.max_w = g_style_sheet.tooltip_max_width > 0
+                 ? g_style_sheet.tooltip_max_width
+                 : TOOLTIP_DEFAULT_MAX_WIDTH;
+  tt.pad_l = tt.style.padding_left_set ? tt.style.padding_left
+                                       : TOOLTIP_DEFAULT_PADDING;
+  tt.pad_r = tt.style.padding_right_set ? tt.style.padding_right
+                                        : TOOLTIP_DEFAULT_PADDING;
+  tt.pad_t = tt.pad_l;
+  tt.pad_b = tt.pad_r;
+  int inner_max = tt.max_w - tt.pad_l - tt.pad_r;
+  if (inner_max < 80)
+    inner_max = 80;
+  int saved_max = tt.max_w;
+  tt.max_w = inner_max;
+  tooltip_measure();
+  tt.max_w = saved_max;
+  int w = tt.body_w + tt.pad_l + tt.pad_r;
+  int h = tt.body_h + tt.pad_t + tt.pad_b;
+  if (w < 24)
+    w = 24;
+  if (h < 20)
+    h = 20;
+  tt.scale = bar->scale > 0 ? bar->scale : 1;
+  tt.surface = wl_compositor_create_surface(compositor);
+  wl_surface_set_buffer_scale(tt.surface, tt.scale);
+  tt.layer_surface = zwlr_layer_shell_v1_get_layer_surface(
+      layer_shell, tt.surface, bar->wl_output,
+      ZWLR_LAYER_SHELL_V1_LAYER_OVERLAY, "mangobar-tooltip");
+  zwlr_layer_surface_v1_add_listener(tt.layer_surface, &tooltip_layer_listener,
+                                     NULL);
+  // The bar is anchored to the top of the output. The tooltip hangs
+  // underneath the bar, centred on the module.
+  zwlr_layer_surface_v1_set_anchor(tt.layer_surface,
+                                   ZWLR_LAYER_SURFACE_V1_ANCHOR_TOP |
+                                       ZWLR_LAYER_SURFACE_V1_ANCHOR_LEFT);
+  // Place the tooltip just below the bar.
+  int top = (int)(bar->height / (uint32_t)tt.scale);
+  tt.anchor_cx = tooltip_module_centre(bar, module);
+  int left = tt.anchor_cx - w / 2;
+  if (left < 2)
+    left = 2;
+  if (bar->out_w > 0 && left + w > bar->out_w - 2)
+    left = bar->out_w - w - 2;
+  if (left < 0)
+    left = 0;
+  zwlr_layer_surface_v1_set_margin(tt.layer_surface, top, 0, 0, left);
+  zwlr_layer_surface_v1_set_size(tt.layer_surface, (uint32_t)w, (uint32_t)h);
+  zwlr_layer_surface_v1_set_exclusive_zone(tt.layer_surface, 0);
+  // Keep clicks going to the bar, not the tooltip.
+  struct wl_region *empty = wl_compositor_create_region(compositor);
+  wl_surface_set_input_region(tt.surface, empty);
+  wl_region_destroy(empty);
+  wl_surface_commit(tt.surface);
+  tt.shown = true;
+}
+
+// Called whenever the hovered module changes. Resets the delay timer when
+// a tooltip is available, and hides the current tooltip immediately when
+// the hover moves off its module.
+static void tooltip_hover_changed(Bar *bar, const char *module) {
+  const char *body = tooltip_body_for(bar, module);
+  if (!body) {
+    tooltip_hide();
+    return;
+  }
+  if (tt.shown && tt.bar == bar && strcmp(tt.module, module) == 0 &&
+      strcmp(tt.body, body) == 0)
+    return; // same tooltip is already up
+  tooltip_destroy_surface();
+  tt.bar = bar;
+  snprintf(tt.module, sizeof(tt.module), "%s", module);
+  tt.hover_since = now_ms();
+}
+
+static void tooltip_tick(void) {
+  if (tt.shown || tt.hover_since == 0 || !tt.bar || !tt.module[0])
+    return;
+  if (now_ms() - tt.hover_since < TOOLTIP_HOVER_DELAY_MS)
+    return;
+  const char *body = tooltip_body_for(tt.bar, tt.module);
+  if (!body) {
+    tt.hover_since = 0;
+    return;
+  }
+  tooltip_show(tt.bar, tt.module, body);
+  tt.hover_since = 0;
+}
+
+// Call when a bar goes away so the tooltip never points at a dead output.
+static void tooltip_output_removed(struct wl_output *output) {
+  if (tt.bar && tt.bar->wl_output == output)
+    tooltip_hide();
+}
+
 // ---------- Pointer input ----------
 static void setup_cursor() {
   if (cursor_surface || !compositor)
@@ -4174,6 +4545,7 @@ static void update_pointer_hover(Bar *bar, bool inside) {
     run_crossing(bar->hover_module, false);
     snprintf(bar->hover_module, sizeof(bar->hover_module), "%s", module);
     run_crossing(bar->hover_module, true);
+    tooltip_hover_changed(bar, bar->hover_module);
     bar->redraw = true;
   }
   if (tag != bar->hover_tag) {
@@ -4997,8 +5369,16 @@ static void start_custom_module(MangoCustomModule *cm) {
 }
 
 // Read the output that the running command has ready. At the end of the
-// output, store the trimmed text and return true when it changed. The text
-// keeps the first 255 bytes, as the module shows one short line.
+// output, store the trimmed text and return true when it changed.
+//
+// The output is one of two shapes:
+//   - plain text, which goes to the module face and leaves the tooltip
+//     empty;
+//   - a Waybar-style JSON envelope `{ "text": ..., "tooltip": ..., "class": ... }`,
+//     in which case the `text` field goes to the face and the `tooltip`
+//     field feeds the hover popup. The display text is kept short, as the
+//     module shows one line. The tooltip body is kept whole up to the
+//     tooltip buffer, as it can span many lines.
 static bool read_custom_module(MangoCustomModule *cm) {
   char buf[512];
   for (;;) {
@@ -5024,10 +5404,45 @@ static bool read_custom_module(MangoCustomModule *cm) {
                    cm->pending[n - 1] == ' ' || cm->pending[n - 1] == '\t'))
     n--;
   cm->pending[n] = '\0';
-  if (strcmp(cm->pending, cm->output) == 0)
-    return false;
-  memcpy(cm->output, cm->pending, n + 1);
-  return true;
+
+  // Resolve the display text and the tooltip body. The default is to take
+  // the raw output as the display text, which keeps a non-JSON module as
+  // it was.
+  char new_text[sizeof(cm->output)];
+  char new_tooltip[sizeof(cm->tooltip)];
+  const char *p = cm->pending;
+  while (*p && (unsigned char)*p <= ' ')
+    p++;
+  bool parsed_json = false;
+  if (*p == '{') {
+    cJSON *root = cJSON_Parse(cm->pending);
+    if (root && cJSON_IsObject(root)) {
+      cJSON *tv = cJSON_GetObjectItemCaseSensitive(root, "text");
+      cJSON *tt = cJSON_GetObjectItemCaseSensitive(root, "tooltip");
+      if (cJSON_IsString(tv)) {
+        snprintf(new_text, sizeof(new_text), "%s", tv->valuestring);
+        snprintf(new_tooltip, sizeof(new_tooltip), "%s",
+                 cJSON_IsString(tt) ? tt->valuestring : "");
+        parsed_json = true;
+      }
+    }
+    if (root)
+      cJSON_Delete(root);
+  }
+  if (!parsed_json) {
+    size_t len = strlen(cm->pending);
+    if (len >= sizeof(new_text))
+      len = sizeof(new_text) - 1;
+    memcpy(new_text, cm->pending, len);
+    new_text[len] = '\0';
+    new_tooltip[0] = '\0';
+  }
+
+  bool changed = strcmp(new_text, cm->output) != 0 ||
+                 strcmp(new_tooltip, cm->tooltip) != 0;
+  memcpy(cm->output, new_text, sizeof(cm->output));
+  memcpy(cm->tooltip, new_tooltip, sizeof(cm->tooltip));
+  return changed;
 }
 
 // Whether any active bar currently uses this profile.
@@ -5171,6 +5586,8 @@ static void event_loop() {
       timeout = 100;
     else if (popup.open)
       timeout = 50;
+    else if (tt.hover_since != 0 && !tt.shown)
+      timeout = 100; // wake up near the tooltip deadline
     {
       Bar *wb;
       wl_list_for_each(wb, &bar_list, link) if (wb->commit_pending) {
@@ -5302,6 +5719,8 @@ static void event_loop() {
     }
     // Auto-open submenus on hover
     menu_hover_tick();
+    // Show the hover tooltip after its delay elapses
+    tooltip_tick();
     // Retry opening the tray menu when its property wasn't ready
     if (popup.pending_item && now_ms() - popup.pending_ms >= 300) {
       MangobarTrayItem *pi = popup.pending_item;

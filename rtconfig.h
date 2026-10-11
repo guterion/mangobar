@@ -36,19 +36,25 @@ enum MangoModule {
   M_CUSTOM = 100, // + index into g_cfg.customs
 };
 
+// A custom module can print either plain text or the Waybar-style JSON
+// envelope `{ "text": ..., "tooltip": ..., "class": ... }`. The text goes
+// to the module face, and the tooltip feeds the hover popup. The buffers
+// hold a tooltip that spans many lines, as the slot-conflict output of
+// `gupdate waybar` does.
 typedef struct {
   char name[64]; // e.g. "power" -> CSS #custom-power
   char exec[256]; // command that prints the module text
   char format[256]; // format string; "{}" is replaced with exec output
   int interval; // refresh interval in seconds
   int signal; // SIGRTMIN+N used to trigger an update (0 = none)
-  char output[256]; // latest command output
+  char output[256]; // latest display text
+  char tooltip[4096]; // latest tooltip body (Pango markup allowed)
   uint64_t last_run_ms; // start of the latest run
   bool enabled;
   bool running; // a run is in flight, and fd holds its output pipe
   int fd; // read end of the output pipe of the running command
   size_t pending_len;
-  char pending[256]; // output of the running command so far
+  char pending[4096]; // output of the running command so far
 } MangoCustomModule;
 
 // Per-instance battery module ("battery" + "battery#<device>")

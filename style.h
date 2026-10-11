@@ -98,6 +98,12 @@ typedef struct {
     Style menuitem_hover;
     int menu_font_size; // 0 = use default
     int menu_radius; // 0 = use default 10
+    // Hover tooltip style (global). A `tooltip.<module>` rule overlays this
+    // for one module at show time.
+    Style tooltip;
+    int tooltip_font_size; // 0 = use default
+    int tooltip_radius; // 0 = use default 6
+    int tooltip_max_width; // logical pixels; 0 = default 480
     bool loaded;
 } StyleSheet;
 
@@ -130,6 +136,10 @@ Style style_resolve_state(const StyleSheet *ss, const char *module,
 
 // Overlay `over` on top of `base`: fields set in `over` replace base values.
 Style style_overlay(const Style *base, const Style *over);
+
+// Resolve the tooltip style for one module. The global `tooltip` rule is
+// the base, then any `tooltip.<module>` rules overlay the specifics.
+Style style_resolve_tooltip(const StyleSheet *ss, const char *module);
 
 // Build an fcft font string from CSS font settings.
 // Returns fallback when no font is set. Static buffer.

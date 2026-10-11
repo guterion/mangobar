@@ -732,6 +732,27 @@ static void parse_selector(const char *sel, char *module, size_t msz,
   } else if (strncmp(p, "menu", 4) == 0) {
     strncpy(module, "menu", msz - 1);
     return;
+  } else if (strncmp(p, "tooltip", 7) == 0) {
+    // `tooltip`         -> module="tooltip", state=""
+    // `tooltip.<name>`  -> module="tooltip", state="<name>"
+    // The state carries the module name that this tooltip rule applies to,
+    // so one style sheet can style tooltips of different modules.
+    strncpy(module, "tooltip", msz - 1);
+    p += 7;
+    while (*p && isspace((unsigned char)*p))
+      p++;
+    if (*p == '.') {
+      p++;
+      const char *q = p;
+      while (*q && !isspace((unsigned char)*q) && *q != '{' && *q != '}')
+        q++;
+      size_t n = (size_t)(q - p);
+      if (n >= ssz)
+        n = ssz - 1;
+      memcpy(state, p, n);
+      state[n] = '\0';
+    }
+    return;
   }
   // Skip child prefixes like "button"
   while (*p && isspace((unsigned char)*p))
@@ -833,6 +854,7 @@ int style_sheet_parse(StyleSheet *ss, const char *buf) {
     if (*p == '{')
       p++;
     bool is_menu_rule = strstr(selector, "menu") != NULL;
+    bool is_tooltip_rule = strstr(selector, "tooltip") != NULL;
 
     // Declaration block
     Style decl = {0};
@@ -872,6 +894,10 @@ int style_sheet_parse(StyleSheet *ss, const char *buf) {
       if (prop[0]) {
         if (is_menu_rule && strcmp(prop, "font-size") == 0)
           ss->menu_font_size = parse_int(vp);
+        else if (is_tooltip_rule && strcmp(prop, "font-size") == 0)
+          ss->tooltip_font_size = parse_int(vp);
+        else if (is_tooltip_rule && strcmp(prop, "max-width") == 0)
+          ss->tooltip_max_width = parse_int(vp);
         else
           apply_decl(ss, &decl, prop, vp);
       }
@@ -897,6 +923,10 @@ int style_sheet_parse(StyleSheet *ss, const char *buf) {
       } else if (strcmp(r->module, "menuitem") == 0 &&
                  strcmp(r->state, "hover") == 0) {
         apply_rule(&ss->menuitem_hover, r);
+      } else if (strcmp(r->module, "tooltip") == 0 && r->state[0] == '\0') {
+        apply_rule(&ss->tooltip, r);
+        if (r->style.radius_set)
+          ss->tooltip_radius = r->style.radius;
       }
       tok = strtok(NULL, ",");
     }
@@ -1050,6 +1080,18 @@ Style style_resolve_state(const StyleSheet *ss, const char *module,
       if (strcmp(r->module, name) == 0 && strcmp(r->state, state) == 0)
         apply_rule(&s, r);
     }
+  }
+  return s;
+}
+
+Style style_resolve_tooltip(const StyleSheet *ss, const char *module) {
+  Style s = ss->tooltip;
+  if (!module || !*module)
+    return s;
+  for (int i = 0; i < ss->rule_count; i++) {
+    const StyleRule *r = &ss->rules[i];
+    if (strcmp(r->module, "tooltip") == 0 && strcmp(r->state, module) == 0)
+      apply_rule(&s, r);
   }
   return s;
 }

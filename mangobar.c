@@ -4269,6 +4269,27 @@ static void tooltip_measure(void) {
   cairo_surface_destroy(cs);
 }
 
+// A filter for `pango_attr_list_filter` that matches the colour attributes
+// of a `PangoAttrList`. The shadow loop of `tooltip_draw` strips these
+// attributes from the layout, because a `foreground` from the markup wins
+// over the `cairo_set_source_rgba` of a shadow pass and gives a coloured
+// echo of each glyph instead of a halo.
+static gboolean tooltip_attr_is_colour(PangoAttribute *attr, gpointer data) {
+  (void)data;
+  switch (attr->klass->type) {
+  case PANGO_ATTR_FOREGROUND:
+  case PANGO_ATTR_BACKGROUND:
+  case PANGO_ATTR_FOREGROUND_ALPHA:
+  case PANGO_ATTR_BACKGROUND_ALPHA:
+  case PANGO_ATTR_UNDERLINE_COLOR:
+  case PANGO_ATTR_STRIKETHROUGH_COLOR:
+  case PANGO_ATTR_OVERLINE_COLOR:
+    return TRUE;
+  default:
+    return FALSE;
+  }
+}
+
 static void tooltip_draw(void) {
   if (!tt.shown || !tt.configured)
     return;
@@ -4326,13 +4347,26 @@ static void tooltip_draw(void) {
                : 0;
   cairo_rounded_rect(cr, 0, 0, tt.width, tt.height, tt.radius);
   cairo_set_source_rgba(cr, bg_r, bg_g, bg_b, bg_a);
-  cairo_fill_preserve(cr);
+  cairo_fill(cr);
+
+  // Paint the background-image layers (the CRT scan lines of the theme) on
+  // top of the background and below the border. The layer helper writes to
+  // `bar_bg_cr`, so the tooltip gives it this surface for the call and puts
+  // the previous value back after.
+  if (tt.style.bg_layer_count > 0) {
+    cairo_t *saved_bar_bg = bar_bg_cr;
+    bar_bg_cr = cr;
+    draw_background_layers(tt.style.bg_layers, tt.style.bg_layer_count, 0, 0,
+                           (double)tt.width, (double)tt.height,
+                           (double)tt.radius);
+    bar_bg_cr = saved_bar_bg;
+  }
+
   if (bw > 0) {
+    cairo_rounded_rect(cr, 0, 0, tt.width, tt.height, tt.radius);
     cairo_set_source_rgba(cr, bd_r, bd_g, bd_b, bd_a);
     cairo_set_line_width(cr, bw);
     cairo_stroke(cr);
-  } else {
-    cairo_new_path(cr);
   }
 
   PangoLayout *l = pango_cairo_create_layout(cr);
@@ -4349,6 +4383,57 @@ static void tooltip_draw(void) {
       pango_layout_set_attributes(l, attrs);
   } else {
     pango_layout_set_text(l, tt.body, -1);
+  }
+
+  // Paint the text-shadow layers (the phosphor glow of the theme). Each
+  // layer draws the layout eight times on a ring of radius blur/2, with
+  // the shadow colour and 1/8 of its alpha, so the sum looks like a soft
+  // halo. The blur is capped at 8 px, because a wider ring needs more
+  // samples to stay smooth and a tooltip redraw is already costly.
+  // ponytail: 8-sample ring, add a second ring if a blur above 8 px shows
+  // visible banding.
+  //
+  // The shadow passes need the layout without its colour attributes, so a
+  // halo takes the shadow colour instead of the `foreground` of the markup.
+  // The full attribute list goes back on the layout before the text pass.
+  PangoAttrList *saved_attrs = NULL;
+  if (tt.style.text_shadow_count > 0 && attrs) {
+    saved_attrs = pango_attr_list_copy(attrs);
+    PangoAttrList *dropped =
+        pango_attr_list_filter(attrs, tooltip_attr_is_colour, NULL);
+    if (dropped)
+      pango_attr_list_unref(dropped);
+  }
+  for (int si = 0; si < tt.style.text_shadow_count; si++) {
+    const Shadow *s = &tt.style.text_shadows[si];
+    uint32_t sc = s->color;
+    double sr = ((sc >> 24) & 0xff) / 255.0;
+    double sg = ((sc >> 16) & 0xff) / 255.0;
+    double sb = ((sc >> 8) & 0xff) / 255.0;
+    double sa = (sc & 0xff) / 255.0;
+    int blur = s->blur > 8 ? 8 : s->blur;
+    if (blur <= 0) {
+      cairo_move_to(cr, tt.pad_l + s->x, tt.pad_t + s->y);
+      cairo_set_source_rgba(cr, sr, sg, sb, sa);
+      pango_cairo_show_layout(cr, l);
+      continue;
+    }
+    const int samples = 8;
+    double ring = blur / 2.0;
+    double a_per = sa / samples;
+    for (int i = 0; i < samples; i++) {
+      double theta = (2.0 * M_PI * i) / samples;
+      double dx = (double)s->x + ring * cos(theta);
+      double dy = (double)s->y + ring * sin(theta);
+      cairo_move_to(cr, (double)tt.pad_l + dx, (double)tt.pad_t + dy);
+      cairo_set_source_rgba(cr, sr, sg, sb, a_per);
+      pango_cairo_show_layout(cr, l);
+    }
+  }
+
+  if (saved_attrs) {
+    pango_layout_set_attributes(l, saved_attrs);
+    pango_attr_list_unref(saved_attrs);
   }
   cairo_move_to(cr, tt.pad_l, tt.pad_t);
   cairo_set_source_rgb(cr, fg_r, fg_g, fg_b);

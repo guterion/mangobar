@@ -83,3 +83,16 @@ executable('mangobar',
   dependencies: deps,
   install: true
 )
+
+# The check owns the watcher name, so it runs on a private session bus.
+dbus_run_session = find_program('dbus-run-session', required: false)
+if dbus_run_session.found()
+  test('watcher prune',
+    dbus_run_session,
+    args: ['--', executable('watcher_prune_test',
+      sources: ['tests/watcher_prune_test.c', 'menu.c'],
+      dependencies: deps,
+      build_by_default: false,
+    )],
+  )
+endif

@@ -1132,7 +1132,41 @@ static int watcher_get_protocol_version(sd_bus *bus, const char *obj_path,
   return sd_bus_message_append_basic(reply, 'i', &val);
 }
 
-static int watcher_noop(sd_bus_message *msg, void *data, sd_bus_error *error) {
+// An item id is a service name, alone or with an object path after it.
+static bool item_id_has_service(const char *id, const char *service) {
+  size_t length = strlen(service);
+  return strncmp(id, service, length) == 0 &&
+         (id[length] == '\0' || id[length] == '/');
+}
+
+// Remove each item whose service lost its owner, so the list holds live items.
+static int watcher_handle_name_owner_changed(sd_bus_message *msg, void *data,
+                                             sd_bus_error *error) {
+  TrayWatcher *watcher = data;
+  char *name = NULL, *old_owner = NULL, *new_owner = NULL;
+  int ret = sd_bus_message_read(msg, "sss", &name, &old_owner, &new_owner);
+  if (ret < 0)
+    return ret;
+  if (*new_owner)
+    return 0;
+  bool removed = false;
+  for (int i = 0; i < watcher->item_count; i++) {
+    if (!item_id_has_service(watcher->items[i], name))
+      continue;
+    sd_bus_emit_signal(watcher->tray->bus, WATCHER_PATH, watcher->interface,
+                       "StatusNotifierItemUnregistered", "s",
+                       watcher->items[i]);
+    free(watcher->items[i]);
+    memmove(&watcher->items[i], &watcher->items[i + 1],
+            sizeof(*watcher->items) * (watcher->item_count - i - 1));
+    watcher->item_count--;
+    i--;
+    removed = true;
+  }
+  if (removed)
+    sd_bus_emit_properties_changed(watcher->tray->bus, WATCHER_PATH,
+                                   watcher->interface,
+                                   "RegisteredStatusNotifierItems", NULL);
   return 0;
 }
 
@@ -1166,7 +1200,8 @@ static TrayWatcher *create_watcher(MangobarTray *tray, const char *protocol) {
     goto err;
   if (sd_bus_match_signal(tray->bus, &w->signal_slot, "org.freedesktop.DBus",
                           "/org/freedesktop/DBus", "org.freedesktop.DBus",
-                          "NameOwnerChanged", watcher_noop, w) < 0)
+                          "NameOwnerChanged",
+                          watcher_handle_name_owner_changed, w) < 0)
     goto err;
   if (sd_bus_request_name(tray->bus, w->interface, 0) < 0)
     goto err;
